@@ -17,7 +17,8 @@ When your computer shuts down, tmux sessions are lost -- including any running
 [Codex CLI](https://github.com/openai/codex),
 [Pi](https://github.com/mariozechner/pi),
 [Oh My Pi](https://github.com/can1357/oh-my-pi), or
-**Grok** (xAI's `grok` CLI / Grok Build TUI) instances. This project hooks into
+[Grok Build](https://x.ai/cli) (xAI's `grok` CLI / TUI, not the community
+`grok-cli`) instances. This project hooks into
 [tmux-resurrect](https://github.com/tmux-plugins/tmux-resurrect) to
 automatically save assistant session IDs, CLI flags, and environment variables,
 then re-launch them with the exact same configuration after a restore.
