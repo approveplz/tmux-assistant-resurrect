@@ -7,7 +7,7 @@ classification or screen content analysis. The save script:
 
 1. Takes a single `ps -eo pid=,ppid=,args=` snapshot (efficient, no per-pane calls)
 2. For each tmux pane, finds direct child processes of the pane's shell
-3. Matches binary names via `case` patterns (`*/claude`, `*/opencode`, `*/codex`, `*/pi`, `*/omp`)
+3. Matches binary names via `case` patterns (`*/claude`, `*/opencode`, `*/codex`, `*/pi`, `*/omp`, `*/grok`)
 4. Excludes known false positives (e.g., `opencode run ...` LSP subprocesses)
 
 This is simple, fast, and deterministic. No API calls, no LLM costs, no
@@ -44,6 +44,14 @@ before hooks/plugins have fired):
   terminal breadcrumb lookup under `$XDG_STATE_HOME/omp` plus session JSONL
   lookup under `$XDG_DATA_HOME/omp` or `~/.omp/agent/sessions` (primary for
   fresh sessions, with `--profile` and `--session-dir` support)
+- **Grok**: PID lookup in the `~/.grok/active_sessions.json` registry
+  (primary); `-r <uuid>` / `--resume <uuid>` in process args (fallback). grok
+  records every live interactive session (including a bare `grok` launched
+  with no args) in the registry keyed by PID, so unlike the cwd-scoped
+  fallbacks above, two sessions sharing a working directory never collide.
+  Resume intentionally drops captured CLI args because grok reloads the
+  session's own model/agent/context from disk and its prompt is a positional
+  argument that must not be replayed.
 
 ## Adding a new assistant
 

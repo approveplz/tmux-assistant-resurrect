@@ -3,8 +3,8 @@
 ## Project overview
 
 tmux-assistant-resurrect persists AI coding assistant sessions (Claude Code,
-OpenCode, Codex CLI, Pi) across tmux restarts. It hooks into tmux-resurrect to
-save session IDs and restore them automatically.
+OpenCode, Codex CLI, Pi, Oh My Pi, Grok) across tmux restarts. It hooks into
+tmux-resurrect to save session IDs and restore them automatically.
 
 ## Architecture
 
@@ -93,7 +93,10 @@ process args as a reliable fallback.
   All are optional for backward compatibility.
 - `extract_cli_args()` in `save-assistant-sessions.sh` strips per-tool session
   args: Claude `--resume[= ]<id>`, OpenCode `--session[= ]<id>` and `-s <id>`,
-  Codex `resume <id>`, Pi `--session[= ]<id>`. Returns normalized whitespace-trimmed string.
+  Codex `resume <id>`, Pi `--session[= ]<id>`, Grok `--resume`/`-r`/`--session-id`/
+  `--continue`. Returns normalized whitespace-trimmed string. (Grok's restore
+  ignores the result — see `restore-assistant-sessions.sh` — but the field is
+  still populated for the sidecar JSON.)
 - The restore script only restores env vars listed in
   `@assistant-resurrect-capture-env` (not `tmux_pane` or `shell`), prepended
   as `VAR='val'` prefix to the resume command
@@ -112,6 +115,7 @@ changes after an upgrade, check the relevant source to confirm.
 | **OpenCode SQLite DB** at `~/.local/share/opencode/opencode.db` | Fallback session ID extraction when plugin state file and args are unavailable; matches by cwd + most recent `time_updated` | Check DB schema: `sqlite3 ~/.local/share/opencode/opencode.db ".schema session"` |
 | **Codex writes `~/.codex/session-tags.jsonl`** | Primary session ID source for Codex (PID → session mapping) | Run Codex and check `cat ~/.codex/session-tags.jsonl` |
 | **Pi session files live in `~/.pi/agent/sessions/--<cwd>--/*.jsonl`** | Primary session ID source for Pi when `--session` is absent in args; save script reads header `type=id/cwd/timestamp` and scores candidates by process lifetime + mtime | Run Pi and inspect `~/.pi/agent/sessions`, verify first JSONL line has `{"type":"session","id":"..."}` |
+| **grok writes `~/.grok/active_sessions.json`** | Primary session ID source for Grok: an array of `{session_id, pid, cwd, opened_at}` for every live session, updated on open/close. `get_grok_session()` looks up by PID (works even for a bare `grok` with no args); `-r`/`--resume <uuid>` in process args is the fallback. `GROK_HOME` overrides the `~/.grok` base. | Run `grok`, then `cat ~/.grok/active_sessions.json`; confirm each running `grok` PID appears with its `session_id` |
 | **tmux-resurrect pane content archive** layout: `./pane_contents/pane-{session}:{window}.{pane}` inside `pane_contents.tar.gz` | `strip_assistant_pane_contents()` removes assistant pane files from this archive to prevent stale TUI flash on restore | tmux-resurrect source: `scripts/helpers.sh:pane_contents_file()` |
 
 ## Platform gotchas

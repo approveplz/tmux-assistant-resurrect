@@ -213,6 +213,15 @@ while read -r entry; do
 			resume_cmd="command omp --resume ${safe_sid}"
 		fi
 		;;
+	grok)
+		# Deliberately ignore cli_args for grok. Resuming reloads the
+		# session's own model/agent/context from disk, and grok's prompt is a
+		# positional argument — replaying captured args risks re-submitting a
+		# stale prompt into the resumed session. A clean `grok --resume <id>`
+		# is the correct restore. The generic cwd `cd` below still runs first,
+		# which also lets grok locate the (cwd-scoped) session directory.
+		resume_cmd="command grok --resume ${safe_sid}"
+		;;
 	*)
 		log "unknown tool '$tool' for pane $pane, skipping"
 		continue

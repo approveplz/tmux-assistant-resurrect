@@ -10,11 +10,11 @@
 # --- detect_tool ---
 # Match binary name with optional path prefix, standalone or with arguments.
 # Handles: /path/to/claude, claude, claude --resume ..., opencode -s ...,
-#          codex resume ..., pi --session ..., omp --resume ..., etc.
+#          codex resume ..., pi --session ..., omp --resume ..., grok --resume ..., etc.
 # Excludes: opencode run ... (LSP subprocesses), omp __omp_worker_* subprocesses
 #
 # Limitation: patterns match any command line containing /claude, /opencode,
-# /codex, /pi, or /omp as a path component. An unrelated binary with the same name
+# /codex, /pi, /omp, or /grok as a path component. An unrelated binary with the same name
 # (e.g., a LaTeX tool named "codex") would be falsely detected. In practice this is rare
 # inside tmux panes, but worth noting. Future: could verify identity via
 # --version or known subcommands if false positives become an issue.
@@ -38,6 +38,7 @@ detect_tool() {
 		*) echo "omp" ;;
 		esac
 		;;
+	grok | grok\ * | */grok | */grok\ *) echo "grok" ;;
 	esac
 }
 

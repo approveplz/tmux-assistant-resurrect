@@ -744,6 +744,50 @@ get_omp_session() {
 	fi
 }
 
+# Resolve grok's active-sessions registry path. grok records every live
+# interactive session in ~/.grok/active_sessions.json as an array of
+#   { "session_id": "<uuid>", "pid": <int>, "cwd": "<path>", "opened_at": "..." }
+# and updates it on session open/close. GROK_HOME lets tests (and unusual
+# installs) point this at a fixture directory.
+grok_active_sessions_file() {
+	echo "${GROK_HOME:-$HOME/.grok}/active_sessions.json"
+}
+
+get_grok_session() {
+	local child_pid="$1"
+	local args="$2"
+
+	# Method 1 (primary): PID lookup in grok's active-sessions registry.
+	# Authoritative for every running session regardless of launch form — a
+	# bare `grok` (no args) is recorded here with its session_id — and lookup
+	# is keyed by PID, so two sessions sharing a cwd never collide (the
+	# cwd-scoped ambiguity that opencode/codex/pi fallbacks suffer from does
+	# not apply to grok).
+	local registry sid
+	registry=$(grok_active_sessions_file)
+	if [ -f "$registry" ]; then
+		sid=$(jq -r --arg pid "$child_pid" \
+			'.[]? | select((.pid | tostring) == $pid) | .session_id // empty' \
+			"$registry" 2>/dev/null | head -n1 || true)
+		if [ -n "$sid" ]; then
+			echo "$sid"
+			return
+		fi
+	fi
+
+	# Method 2 (fallback): -r/--resume <uuid> in process args. Covers the
+	# chicken-and-egg window right after a restore, before grok has rewritten
+	# active_sessions.json. Anchored to a 36-char UUID so a trailing prompt
+	# positional can't be mistaken for the ID. Handles `--resume <id>`,
+	# `--resume=<id>`, `-r <id>`, and `-r=<id>`.
+	sid=$(echo "$args" | sed -n 's/.*--resume[= ] *\([0-9a-fA-F]\{8\}-[0-9a-fA-F-]\{27\}\).*/\1/p')
+	[ -z "$sid" ] && sid=$(echo "$args" | sed -n 's/.*-r[= ] *\([0-9a-fA-F]\{8\}-[0-9a-fA-F-]\{27\}\).*/\1/p')
+	if [ -n "$sid" ]; then
+		echo "$sid"
+		return
+	fi
+}
+
 register_codex_session_id() {
 	local sid="$1"
 	[ -z "$sid" ] && return
@@ -914,6 +958,7 @@ SESSION_FLAG_PATTERN_claude='^--(resume|continue|session-id|fork-session|from-pr
 SESSION_FLAG_PATTERN_opencode='^--session$'
 SESSION_FLAG_PATTERN_pi='^--(session|resume|continue|fork)$'
 SESSION_FLAG_PATTERN_omp='^--(session|resume|continue|fork)$'
+SESSION_FLAG_PATTERN_grok='^--(resume|continue|session-id|fork-session)$'
 # codex uses subcommands (resume, fork), not --flags — handled separately.
 SESSION_SUBCMD_PATTERN_codex='resume|fork'
 # Codex resume/fork have subcommand-specific picker flags that must also
@@ -936,6 +981,10 @@ SESSION_FLAGS_FALLBACK_omp="--continue -c
 --fork
 --resume -r
 --session"
+SESSION_FLAGS_FALLBACK_grok="--continue -c
+--fork-session
+--resume -r
+--session-id -s"
 
 # Pre-warm session-identity discovery once per tool present in a tab-separated
 # MATCHES blob (tool name in field 2). extract_cli_args runs in a $() subshell
@@ -1100,6 +1149,7 @@ resolve_pane_candidates() {
 			codex) session_id=$(get_codex_session "$cand_pid" "$cand_args" "$pane_cwd") ;;
 			pi) session_id=$(get_pi_session "$cand_pid" "$cand_args" "$pane_cwd") ;;
 			omp) session_id=$(get_omp_session "$cand_pid" "$cand_args" "$pane_cwd" "$pane_tty") ;;
+			grok) session_id=$(get_grok_session "$cand_pid" "$cand_args") ;;
 			esac
 
 			if [ -n "$session_id" ]; then
@@ -1210,6 +1260,7 @@ main() {
 			else if (line ~ /(^codex( |$)|\/codex( |$))/)                                        proc_tool[pid] = "codex"
 			else if (line ~ /(^pi( |$)|\/pi( |$))/)                                              proc_tool[pid] = "pi"
 			else if (line ~ /(^omp( |$)|\/omp( |$))/ && line !~ /__omp_worker_/)                 proc_tool[pid] = "omp"
+			else if (line ~ /(^grok( |$)|\/grok( |$))/)                                          proc_tool[pid] = "grok"
 		}
 		END {
 			for (i = 1; i <= pane_count; i++) {
@@ -1420,6 +1471,7 @@ emit_session() {
 	codex) session_id=$(get_codex_session "$cpid" "$cargs" "$cwd") ;;
 	pi) session_id=$(get_pi_session "$cpid" "$cargs" "$cwd") ;;
 	omp) session_id=$(get_omp_session "$cpid" "$cargs" "$cwd" "") ;;
+	grok) session_id=$(get_grok_session "$cpid" "$cargs") ;;
 	esac
 
 	if [ -n "$session_id" ]; then

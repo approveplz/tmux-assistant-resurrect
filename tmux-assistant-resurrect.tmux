@@ -8,6 +8,7 @@
 # 3. Claude Code hooks in ~/.claude/settings.json
 # 4. OpenCode session-tracker plugin in ~/.config/opencode/plugins/
 # 5. Pi and Oh My Pi support via local session-file lookup (no hook required)
+# 6. Grok support via the ~/.grok/active_sessions.json registry (no hook required)
 
 CURRENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
