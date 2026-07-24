@@ -1580,7 +1580,13 @@ echo "=== Test 5c4: Codex resume arg fallback (chicken-and-egg) ==="
 echo ""
 
 tmux new-session -d -s test-codex-resume -c /tmp
-tmux send-keys -t test-codex-resume "codex resume ses_codex_from_args" Enter
+tmux set-option -g @assistant-resurrect-capture-env 'CODEX_HOME' 2>/dev/null
+codex_resume_home_dir="/tmp/codex alternate home.$$"
+# Codex exits during startup when CODEX_HOME does not exist. Create a real
+# alternate home so the process remains alive for save-time inspection.
+mkdir -p "$codex_resume_home_dir"
+codex_resume_home_quoted=$(posix_quote "$codex_resume_home_dir")
+tmux send-keys -t test-codex-resume "CODEX_HOME=$codex_resume_home_quoted codex resume ses_codex_from_args" Enter
 codex_resume_shell_pid=$(tmux display-message -t test-codex-resume -p '#{pane_pid}')
 wait_for_child "$codex_resume_shell_pid" "codex" 10 >/dev/null || echo "WARN: codex child not found for resume test"
 
@@ -1592,8 +1598,12 @@ just save 2>&1
 
 codex_resume_sid=$(jq -r '.sessions[] | select(.pane | contains("test-codex-resume")) | .session_id' "$HOME/.tmux/resurrect/assistant-sessions.json" 2>/dev/null)
 assert_eq "Codex resume arg fallback extracts session ID" "ses_codex_from_args" "$codex_resume_sid"
+codex_resume_saved_home=$(jq -r '.sessions[] | select(.pane | contains("test-codex-resume")) | .env.CODEX_HOME' "$HOME/.tmux/resurrect/assistant-sessions.json" 2>/dev/null)
+assert_eq "Save captures configured env from Codex process" "$codex_resume_home_dir" "$codex_resume_saved_home"
 
 kill_pane_children test-codex-resume true
+tmux set-option -gu @assistant-resurrect-capture-env 2>/dev/null || true
+rm -rf "$codex_resume_home_dir"
 
 # --- Test 5c4b: Codex rollout session files (e2e) ---
 #
