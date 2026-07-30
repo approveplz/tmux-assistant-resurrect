@@ -1286,7 +1286,11 @@ main() {
 	WATCHDOG_PID=""
 	WATCHDOG_SELF_FILE=""
 	WATCHDOG_FIRED_FILE=""
-	trap 'rm -f "$PS_FILE" "$PANE_FILE" "$PARTS_FILE" "$STATE_CACHE_FILE" "${WATCHDOG_SELF_FILE:-}" "${WATCHDOG_FIRED_FILE:-}" "${OUTPUT_FILE}.tmp.$$"; stop_save_watchdog' EXIT INT TERM
+	# stop_save_watchdog MUST run before the rm: it reads WATCHDOG_FIRED_FILE to
+	# decide whether the watchdog has already fired (and so must not be cancelled).
+	# Deleting that file first would make the fired-check always fail, cancelling a
+	# mid-escalation watchdog and defeating the whole grandchild-leak guarantee.
+	trap 'stop_save_watchdog; rm -f "$PS_FILE" "$PANE_FILE" "$PARTS_FILE" "$STATE_CACHE_FILE" "${WATCHDOG_SELF_FILE:-}" "${WATCHDOG_FIRED_FILE:-}" "${OUTPUT_FILE}.tmp.$$"' EXIT INT TERM
 
 	# Arm the watchdog (unless disabled with a 0/invalid timeout).
 	if [ "$SAVE_TIMEOUT" -gt 0 ]; then

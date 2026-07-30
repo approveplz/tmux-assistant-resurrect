@@ -3802,6 +3802,10 @@ save_watchdog "\$\$" "\$selffile" "\$WATCHDOG_FIRED_FILE" >/dev/null &
 WATCHDOG_PID=\$!
 echo "\$WATCHDOG_PID" >"\$selffile"
 disown "\$WATCHDOG_PID" 2>/dev/null || true
+# Mirror main()'s cleanup trap EXACTLY, including the file-removal ordering, so
+# this exercises the real stop-then-rm path (a trap that rm'd the fired file
+# before stop_save_watchdog would silently defeat the fired-check).
+trap 'stop_save_watchdog; rm -f "\$selffile" "\$WATCHDOG_FIRED_FILE"' EXIT
 start=\$SECONDS
 case "\$mode" in
 hard)
@@ -3823,7 +3827,7 @@ grandchild)
 	;;
 esac
 echo "ELAPSED=\$((SECONDS - start))"
-stop_save_watchdog
+# stop_save_watchdog runs from the EXIT trap above (real trap ordering).
 WDEOF
 
 # Normal mode: the watchdog TERMs the wedged worker so main unblocks in time.
