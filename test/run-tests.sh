@@ -3829,7 +3829,7 @@ rm -rf "$WD_DIR"
 # total-runtime deadline) and the event logged. Bounded wait so a broken
 # watchdog fails the test instead of hanging the suite.
 HARD_DIR="$(mktemp -d)"
-bash "$WD_HELPER" "$HARD_DIR" hard >/dev/null 2>&1 &
+bash "$WD_HELPER" "$HARD_DIR" hard >/dev/null 2>"$HARD_DIR/err" &
 hard_pid=$!
 hard_bounded=0
 for _i in $(seq 1 20); do
@@ -3843,8 +3843,10 @@ else
 	kill -9 "$hard_pid" 2>/dev/null || true
 fi
 wait "$hard_pid" 2>/dev/null || true
-sleep 1  # let the orphaned watchdog flush its post-kill log
-assert_contains "watchdog logs the hard timeout" "$(cat "$HARD_DIR/wd.log" 2>/dev/null)" "terminated stuck save"
+sleep 1  # let the orphaned watchdog flush its post-kill report
+# The watchdog reports to stderr only (never to LOG_FILE, which could block on a
+# stalled filesystem and accumulate stuck watchdogs).
+assert_contains "watchdog reports the hard timeout on stderr" "$(cat "$HARD_DIR/err" 2>/dev/null)" "terminated stuck save"
 rm -rf "$HARD_DIR"
 
 # Atomic output: a failing serializer must not destroy the previous sidecar.
@@ -3859,10 +3861,12 @@ atomic_out=$(bash -c '
 	printf "%s" "{\"sentinel\":\"KEEP\"}" >"$OUTPUT_FILE"
 	jq() { return 1; }
 	SAVE_TIMEOUT=0
-	main >/dev/null 2>&1 || true
+	if main >/dev/null 2>&1; then echo "MAIN_OK"; else echo "MAIN_FAIL"; fi
 	cat "$OUTPUT_FILE"
 ' 2>/dev/null || true)
 assert_contains "failing serializer preserves the previous sidecar" "$atomic_out" "KEEP"
+# The empty-sessions branch must surface a serializer failure, not report success.
+assert_contains "failing serializer is reported, not masked as success" "$atomic_out" "MAIN_FAIL"
 rm -rf "$ATOMIC_DIR"
 
 rm -f "$WD_HELPER"

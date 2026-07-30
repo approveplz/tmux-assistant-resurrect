@@ -1237,9 +1237,13 @@ save_watchdog() {
 		kill -KILL "$target" 2>/dev/null || true
 	fi
 
-	# Log last, best-effort: everything is already signalled, so a blocking log
-	# write can no longer prevent the deadline from being enforced.
-	log "save hook exceeded ${SAVE_TIMEOUT}s; terminated stuck save (watchdog)"
+	# Report last, and to STDERR only — never to LOG_FILE. When the hang is a
+	# stalled RESURRECT_DIR filesystem, a file write here would block this
+	# (now orphaned) watchdog forever, and one would pile up per save cycle —
+	# exactly the process accumulation the deadline exists to prevent. stderr is
+	# the hook's own descriptor, not the stalled filesystem, so it can't block on
+	# it; tmux-resurrect surfaces it wherever it captures hook output.
+	echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] save hook exceeded ${SAVE_TIMEOUT}s; terminated stuck save (watchdog)" >&2
 }
 
 # Stop the watchdog and its sleep child on normal completion. Snapshot the
@@ -1476,7 +1480,13 @@ main() {
 		if jq -n --arg ts "$SAVE_TS" '{timestamp: $ts, sessions: []}' >"$OUTPUT_TMP"; then
 			mv -f "$OUTPUT_TMP" "$OUTPUT_FILE"
 		else
+			# Symmetric with the non-empty branch: if we cannot even write the
+			# empty sidecar (e.g. disk full), do not claim "saved 0" and silently
+			# leave a stale, possibly non-empty sidecar that would later restore
+			# sessions that are no longer running. Surface the failure instead.
 			rm -f "$OUTPUT_TMP"
+			log "warning: failed to write empty sidecar; keeping previous $OUTPUT_FILE"
+			return 1
 		fi
 	fi
 
