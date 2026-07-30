@@ -1184,7 +1184,7 @@ ROLLOUT
 ORIG_HOME="$HOME"
 HOME="$ROLLOUT_TEST_DIR"
 
-# Should find session by cwd match (use $$ as a live PID so ps -o etimes= works)
+# Should find session by cwd match (use $$ as a live PID so get_process_start_epoch works)
 rollout_sid=$(get_codex_session $$ "codex" "/tmp/test-project")
 assert_eq "Codex rollout session file lookup by cwd" "ses_rollout_aaa" "$rollout_sid"
 
@@ -1657,6 +1657,66 @@ if [ -r /proc/self/environ ]; then
 	CAPTURE_ENV=""
 else
 	echo "SKIP: /proc unavailable — process env capture is Linux/WSL-only"
+fi
+
+# --- Test 5c4d: process start-time helper (unit) ---
+#
+# get_process_start_epoch() backs Codex/Pi/OMP session matching: it distinguishes
+# the live assistant session from stale sessions sharing a cwd. It reads
+# /proc/PID/stat on Linux and parses `ps -o lstart=` on macOS/BSD (issue #49 —
+# the old `ps -o etimes=` was a GNU keyword BSD ps silently rejected).
+echo ""
+echo "=== Test 5c4d: process start-time helper unit tests ==="
+echo ""
+
+# Cross-platform: a freshly spawned process should report a start epoch that is
+# numeric and within a few seconds of now (covers /proc on Linux, lstart on mac).
+sleep 30 &
+ps_unit_pid=$!
+ps_unit_now=$(date +%s)
+ps_unit_start=$(get_process_start_epoch "$ps_unit_pid")
+case "$ps_unit_start" in
+'' | *[!0-9]*)
+	fail "get_process_start_epoch returns a numeric epoch for a live PID (got '$ps_unit_start')"
+	;;
+*)
+	pass "get_process_start_epoch returns a numeric epoch for a live PID"
+	ps_unit_delta=$((ps_unit_now - ps_unit_start))
+	if [ "$ps_unit_delta" -ge -5 ] && [ "$ps_unit_delta" -le 30 ]; then
+		pass "get_process_start_epoch start time is recent (delta ${ps_unit_delta}s)"
+	else
+		fail "get_process_start_epoch start time is recent (delta ${ps_unit_delta}s, expected 0-30s)"
+	fi
+	;;
+esac
+kill "$ps_unit_pid" 2>/dev/null || true
+wait "$ps_unit_pid" 2>/dev/null || true
+
+# A dead or empty PID degrades to an empty string (matching then falls back to
+# most-recent), never an error.
+assert_eq "get_process_start_epoch is empty for a nonexistent PID" \
+	"" "$(get_process_start_epoch 999999)"
+assert_eq "get_process_start_epoch is empty for an empty PID" \
+	"" "$(get_process_start_epoch "")"
+
+# macOS/BSD: _lstart_to_epoch must parse `ps -o lstart=` output including the
+# space-padded single-digit day the issue calls out. Two timestamps one month
+# apart at the same time of day must land exactly 25 days (2160000s) apart —
+# a timezone-independent check that both the two-digit and space-padded forms
+# parse, and parse correctly. BSD `date -j` only exists on macOS/BSD.
+if date -j -f "%a %b %d %T %Y" "Wed Jul 30 12:00:00 2025" "+%s" >/dev/null 2>&1; then
+	lstart_day30=$(_lstart_to_epoch "Wed Jul 30 12:00:00 2025")
+	lstart_day5=$(_lstart_to_epoch "Sat Jul  5 12:00:00 2025")
+	assert_eq "_lstart_to_epoch parses a two-digit day component" \
+		"1" "$(case "$lstart_day30" in '' | *[!0-9]*) echo 0 ;; *) echo 1 ;; esac)"
+	assert_eq "_lstart_to_epoch parses a space-padded single-digit day component" \
+		"1" "$(case "$lstart_day5" in '' | *[!0-9]*) echo 0 ;; *) echo 1 ;; esac)"
+	assert_eq "_lstart_to_epoch computes both day forms consistently (25 days apart)" \
+		"2160000" "$((lstart_day30 - lstart_day5))"
+	assert_eq "_lstart_to_epoch is empty for an unparseable timestamp" \
+		"" "$(_lstart_to_epoch "not a date")"
+else
+	echo "SKIP: BSD 'date -j' unavailable — lstart parsing is macOS/BSD-only"
 fi
 
 # --- Test 5c4b: Codex rollout session files (e2e) ---
