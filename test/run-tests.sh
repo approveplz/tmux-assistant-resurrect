@@ -1703,8 +1703,9 @@ assert_eq "get_process_start_epoch is empty for an empty PID" \
 # space-padded single-digit day the issue calls out. Two timestamps one month
 # apart at the same time of day must land exactly 25 days (2160000s) apart —
 # a timezone-independent check that both the two-digit and space-padded forms
-# parse, and parse correctly. BSD `date -j` only exists on macOS/BSD.
-if date -j -f "%a %b %d %T %Y" "Wed Jul 30 12:00:00 2025" "+%s" >/dev/null 2>&1; then
+# parse, and parse correctly. BSD `date -j` only exists on macOS/BSD, and the
+# helper calls it by absolute path (/bin/date) so a coreutils PATH can't shadow it.
+if /bin/date -j -f "%a %b %d %T %Y" "Wed Jul 30 12:00:00 2025" "+%s" >/dev/null 2>&1; then
 	lstart_day30=$(_lstart_to_epoch "Wed Jul 30 12:00:00 2025")
 	lstart_day5=$(_lstart_to_epoch "Sat Jul  5 12:00:00 2025")
 	assert_eq "_lstart_to_epoch parses a two-digit day component" \
