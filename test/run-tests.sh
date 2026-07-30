@@ -1715,6 +1715,22 @@ if date -j -f "%a %b %d %T %Y" "Wed Jul 30 12:00:00 2025" "+%s" >/dev/null 2>&1;
 		"2160000" "$((lstart_day30 - lstart_day5))"
 	assert_eq "_lstart_to_epoch is empty for an unparseable timestamp" \
 		"" "$(_lstart_to_epoch "not a date")"
+
+	# Regression: under a localized environment `ps -o lstart=` prints localized
+	# month/day names (fr_FR: "jeu. 30 juil. ..."), which the English parse format
+	# rejects. get_process_start_epoch must pin LC_ALL=C so a non-English tmux
+	# doesn't silently disable process-lifetime matching (issue #49 review).
+	if locale -a 2>/dev/null | grep -qiE "^fr_FR\.(UTF-8|utf8)$"; then
+		sleep 30 &
+		locale_pid=$!
+		locale_epoch=$(LC_ALL=fr_FR.UTF-8 get_process_start_epoch "$locale_pid")
+		assert_eq "get_process_start_epoch resolves under a non-English locale" \
+			"1" "$(case "$locale_epoch" in '' | *[!0-9]*) echo 0 ;; *) echo 1 ;; esac)"
+		kill "$locale_pid" 2>/dev/null || true
+		wait "$locale_pid" 2>/dev/null || true
+	else
+		echo "SKIP: fr_FR.UTF-8 locale unavailable — non-English lstart regression check"
+	fi
 else
 	echo "SKIP: BSD 'date -j' unavailable — lstart parsing is macOS/BSD-only"
 fi

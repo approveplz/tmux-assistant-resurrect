@@ -882,9 +882,11 @@ get_process_start_epoch() {
 	fi
 
 	# Non-Linux (macOS/BSD): no /proc. `ps -o lstart=` gives an absolute start
-	# timestamp we convert to epoch.
+	# timestamp we convert to epoch. Force LC_ALL=C so month/day names come out
+	# in the fixed English form _lstart_to_epoch parses — under a localized tmux
+	# (e.g. fr_BE prints "jeu. 30 juil. ...") the default output won't match.
 	local lstart
-	lstart=$(ps -o lstart= -p "$pid" 2>/dev/null) || return 0
+	lstart=$(LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null) || return 0
 	_lstart_to_epoch "$lstart"
 }
 
@@ -897,8 +899,10 @@ _lstart_to_epoch() {
 	local lstart
 	lstart=$(printf '%s' "$1" | tr -s ' ' | sed -e 's/^ //' -e 's/ $//')
 	[ -n "$lstart" ] || return 0
+	# LC_ALL=C so the English %a/%b names in the format match the input, whatever
+	# locale the caller runs under.
 	local epoch
-	epoch=$(date -j -f "%a %b %d %T %Y" "$lstart" "+%s" 2>/dev/null) || return 0
+	epoch=$(LC_ALL=C date -j -f "%a %b %d %T %Y" "$lstart" "+%s" 2>/dev/null) || return 0
 	case "$epoch" in
 	'' | *[!0-9]*) return 0 ;;
 	esac
