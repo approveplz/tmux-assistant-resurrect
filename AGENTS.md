@@ -71,6 +71,17 @@ process args as a reliable fallback.
 - The `env` object in state files captures `TMUX_PANE` and `SHELL` by default,
   plus user-configured vars via `@assistant-resurrect-capture-env` tmux option
   (space-separated list, set in tmux.conf)
+- For assistants **without** a hook/plugin (Codex, Pi, Oh My Pi, Grok) there is
+  no state file to read `env` from, so `save-assistant-sessions.sh` captures the
+  configured vars directly from the live process: `read_process_env()` reads
+  `/proc/<pid>/environ` (Linux/WSL only; returns `null` where `/proc` is absent,
+  e.g. macOS) and `merge_process_env()` merges those over any hook-captured
+  values with the **process winning**. Only vars listed in
+  `@assistant-resurrect-capture-env` are read, and both call sites in the save
+  script (`resolve_pane_candidates` and `emit_session`) apply the merge. macOS
+  cannot read another process's env unprivileged, so hookless tools capture no
+  env there — document the shell-profile / `tmux set-environment` workaround
+  instead.
 - Log files go to `assistant-{save,restore}.log` in tmux-resurrect's save dir
   (resolved by `resurrect_data_dir` in `lib-detect.sh`; truncated to 500 lines per run)
 - Process inspection uses `ps -eo pid=,ppid=` (not `pgrep -P` -- unreliable on macOS)

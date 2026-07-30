@@ -39,6 +39,7 @@ STATE_DIR="${TMUX_ASSISTANT_RESURRECT_DIR:-${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/t
 RESURRECT_DIR="$(resurrect_data_dir)"
 OUTPUT_FILE="${RESURRECT_DIR}/assistant-sessions.json"
 LOG_FILE="${RESURRECT_DIR}/assistant-save.log"
+CAPTURE_ENV=$(tmux show-option -gqv @assistant-resurrect-capture-env 2>/dev/null || true)
 
 mkdir -p -m 0700 "$STATE_DIR"
 mkdir -p "$RESURRECT_DIR"
@@ -821,6 +822,68 @@ register_omp_session_id() {
 	esac
 }
 
+# Read user-configured variables directly from a detected assistant process.
+# Claude and OpenCode normally provide these through their session hooks, but
+# tools without hooks (including Codex) need save-time process inspection.
+#
+# Linux exposes the environment as NUL-delimited records in /proc. Other
+# platforms retain the existing hook-only behavior by returning null.
+read_process_env() {
+	local pid="$1"
+	local environ_file="/proc/${pid}/environ"
+
+	if [ -z "$CAPTURE_ENV" ]; then
+		echo "null"
+		return
+	fi
+
+	# Open first so a process exiting between detection and inspection cannot
+	# turn the best-effort capture into a fatal redirection error.
+	if ! { exec 3<"$environ_file"; } 2>/dev/null; then
+		echo "null"
+		return
+	fi
+
+	local env_json="{}" entry name value
+	while IFS= read -r -d '' entry; do
+		name="${entry%%=*}"
+		[ "$name" != "$entry" ] || continue
+		[[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+		case " $CAPTURE_ENV " in
+		*" $name "*)
+			value="${entry#*=}"
+			env_json=$(jq -c --arg key "$name" --arg value "$value" \
+				'. + {($key): $value}' <<<"$env_json")
+			;;
+		esac
+	done <&3
+	exec 3<&-
+
+	if [ "$env_json" = "{}" ]; then
+		echo "null"
+	else
+		echo "$env_json"
+	fi
+}
+
+# Merge save-time process variables over hook-captured values. The running
+# process is authoritative for variables explicitly requested by the user.
+merge_process_env() {
+	local pid="$1"
+	local saved_env="${2:-null}"
+	local process_env
+	process_env=$(read_process_env "$pid")
+	if [ -z "$process_env" ] || [ "$process_env" = "null" ]; then
+		echo "${saved_env:-null}"
+		return
+	fi
+
+	jq -nc \
+		--argjson saved "${saved_env:-null}" \
+		--argjson process "$process_env" \
+		'($saved // {}) + $process'
+}
+
 # --- CLI args extraction helpers ---
 
 # Strip a long option: --flag, --flag=val, or --flag val.
@@ -1169,6 +1232,7 @@ resolve_pane_candidates() {
 						env_json=$(jq '.env // null' "$state_file" 2>/dev/null || echo "null")
 					fi
 				fi
+				env_json=$(merge_process_env "$cand_pid" "$env_json")
 
 				# Fallback: parse --model from CLI args if not in state file.
 				# Regex stored in variable for bash 3.2 compat (inline capture groups fail).
@@ -1490,6 +1554,7 @@ emit_session() {
 			model=$(jq -r '.model // empty' "$state_file" 2>/dev/null || true)
 			env_json=$(jq '.env // null' "$state_file" 2>/dev/null || echo "null")
 		fi
+		env_json=$(merge_process_env "$cpid" "$env_json")
 
 		# Fallback: parse --model from CLI args if not in state file
 		if [ -z "$model" ]; then

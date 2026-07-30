@@ -1580,7 +1580,15 @@ echo "=== Test 5c4: Codex resume arg fallback (chicken-and-egg) ==="
 echo ""
 
 tmux new-session -d -s test-codex-resume -c /tmp
-tmux send-keys -t test-codex-resume "codex resume ses_codex_from_args" Enter
+tmux set-option -g @assistant-resurrect-capture-env 'CODEX_HOME' 2>/dev/null
+codex_resume_home_dir="/tmp/codex alternate home.$$"
+# Codex exits during startup when CODEX_HOME does not exist. Create a real
+# alternate home so the process remains alive for save-time inspection.
+mkdir -p "$codex_resume_home_dir"
+codex_resume_home_quoted=$(posix_quote "$codex_resume_home_dir")
+# SECRET_TOKEN is present in the process env but NOT in the capture list, so it
+# must never reach the sidecar (end-to-end whitelist check).
+tmux send-keys -t test-codex-resume "SECRET_TOKEN=must-not-leak CODEX_HOME=$codex_resume_home_quoted codex resume ses_codex_from_args" Enter
 codex_resume_shell_pid=$(tmux display-message -t test-codex-resume -p '#{pane_pid}')
 wait_for_child "$codex_resume_shell_pid" "codex" 10 >/dev/null || echo "WARN: codex child not found for resume test"
 
@@ -1592,8 +1600,64 @@ just save 2>&1
 
 codex_resume_sid=$(jq -r '.sessions[] | select(.pane | contains("test-codex-resume")) | .session_id' "$HOME/.tmux/resurrect/assistant-sessions.json" 2>/dev/null)
 assert_eq "Codex resume arg fallback extracts session ID" "ses_codex_from_args" "$codex_resume_sid"
+codex_resume_saved_home=$(jq -r '.sessions[] | select(.pane | contains("test-codex-resume")) | .env.CODEX_HOME' "$HOME/.tmux/resurrect/assistant-sessions.json" 2>/dev/null)
+assert_eq "Save captures configured env from Codex process" "$codex_resume_home_dir" "$codex_resume_saved_home"
+codex_resume_leak=$(jq -r '.sessions[] | select(.pane | contains("test-codex-resume")) | .env | has("SECRET_TOKEN")' "$HOME/.tmux/resurrect/assistant-sessions.json" 2>/dev/null)
+assert_eq "Save omits env vars outside the capture list" "false" "$codex_resume_leak"
 
 kill_pane_children test-codex-resume true
+tmux set-option -gu @assistant-resurrect-capture-env 2>/dev/null || true
+rm -rf "$codex_resume_home_dir"
+
+# --- Test 5c4a: process env capture helpers (unit) ---
+#
+# read_process_env() / merge_process_env() back the hookless-tool capture above.
+# Exercise them directly against a live helper process so the whitelist, merge
+# precedence, and graceful-degradation paths are covered without a real codex.
+# (The save script is already sourced earlier in this file, so the functions and
+# the global CAPTURE_ENV they read are in scope here.)
+echo ""
+echo "=== Test 5c4a: process env capture unit tests ==="
+echo ""
+
+if [ -r /proc/self/environ ]; then
+	# Helper carrying a whitelisted var (with a space) and a secret we must drop.
+	UNIT_ENV_KEEP="keep me" UNIT_ENV_SECRET="do-not-capture" sleep 30 &
+	unit_env_pid=$!
+
+	CAPTURE_ENV="UNIT_ENV_KEEP"
+	unit_read=$(read_process_env "$unit_env_pid")
+	assert_eq "read_process_env captures whitelisted var (with spaces)" \
+		"keep me" "$(echo "$unit_read" | jq -r '.UNIT_ENV_KEEP')"
+	assert_eq "read_process_env ignores non-whitelisted vars" \
+		"false" "$(echo "$unit_read" | jq -r 'has("UNIT_ENV_SECRET")')"
+
+	# Live process value wins over a stale hook-captured value.
+	unit_merge=$(merge_process_env "$unit_env_pid" '{"UNIT_ENV_KEEP":"stale-hook-value"}')
+	assert_eq "merge_process_env prefers live process over hook value" \
+		"keep me" "$(echo "$unit_merge" | jq -r '.UNIT_ENV_KEEP')"
+
+	# Hook-only vars not in the capture list survive the merge.
+	unit_merge2=$(merge_process_env "$unit_env_pid" '{"UNIT_ENV_KEEP":"stale","tmux_pane":"%9"}')
+	assert_eq "merge_process_env preserves hook-only vars" \
+		"%9" "$(echo "$unit_merge2" | jq -r '.tmux_pane')"
+
+	# Empty capture list is a no-op: the hook value passes through untouched.
+	CAPTURE_ENV=""
+	assert_eq "merge_process_env is a no-op with empty capture list" \
+		"null" "$(merge_process_env "$unit_env_pid" "null")"
+
+	# A dead/nonexistent PID degrades to the hook value without error.
+	CAPTURE_ENV="UNIT_ENV_KEEP"
+	kill "$unit_env_pid" 2>/dev/null || true
+	wait "$unit_env_pid" 2>/dev/null || true
+	assert_eq "merge_process_env falls back to hook value for dead PID" \
+		"hook-only" "$(merge_process_env "$unit_env_pid" '{"UNIT_ENV_KEEP":"hook-only"}' | jq -r '.UNIT_ENV_KEEP')"
+
+	CAPTURE_ENV=""
+else
+	echo "SKIP: /proc unavailable — process env capture is Linux/WSL-only"
+fi
 
 # --- Test 5c4b: Codex rollout session files (e2e) ---
 #
