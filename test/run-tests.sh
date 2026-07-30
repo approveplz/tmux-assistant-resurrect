@@ -1625,6 +1625,14 @@ if [ -r /proc/self/environ ]; then
 	UNIT_ENV_KEEP="keep me" UNIT_ENV_SECRET="do-not-capture" sleep 30 &
 	unit_env_pid=$!
 
+	# Wait until the child has execve'd sleep so /proc/PID/environ reflects the
+	# new environment. Reading between fork and exec sees the parent's environ
+	# (no UNIT_ENV_KEEP) and returns null — a race that flakes under CI load.
+	for _ in $(seq 1 100); do
+		grep -qz "UNIT_ENV_KEEP=keep me" "/proc/$unit_env_pid/environ" 2>/dev/null && break
+		sleep 0.05
+	done
+
 	CAPTURE_ENV="UNIT_ENV_KEEP"
 	unit_read=$(read_process_env "$unit_env_pid")
 	assert_eq "read_process_env captures whitelisted var (with spaces)" \
