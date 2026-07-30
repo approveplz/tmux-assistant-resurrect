@@ -315,8 +315,8 @@ select_jsonl_session_id() {
 	[ "$#" -gt 0 ] || return 0
 	command -v python3 >/dev/null 2>&1 || return 0
 
-	local etimes
-	etimes=$(ps -o etimes= -p "$child_pid" 2>/dev/null | tr -d ' ' || true)
+	local process_start
+	process_start=$(get_process_start_epoch "$child_pid")
 	python3 "$PY_DIR/select_jsonl_session.py" "$cwd" "$process_start" "$used_ids" "$@"
 }
 
@@ -684,9 +684,12 @@ _etime_to_seconds() {
 		rest=$etime
 		;;
 	esac
-	# rest is [hh:]mm:ss — split on ':'.
+	# rest is [hh:]mm:ss — split on ':'. Feed it through a process substitution
+	# (concurrent reader) rather than a `<<<` here-string: on bash >= 5.1 a
+	# here-string is written to a pipe before its reader runs and can block on
+	# macOS under pipe-memory pressure — the same failure mode as issue #48.
 	local -a parts
-	IFS=: read -r -a parts <<<"$rest"
+	IFS=: read -r -a parts < <(printf '%s' "$rest")
 	local hours mins secs
 	case "${#parts[@]}" in
 	3) hours=${parts[0]} mins=${parts[1]} secs=${parts[2]} ;;
