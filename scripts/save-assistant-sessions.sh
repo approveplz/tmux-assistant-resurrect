@@ -32,6 +32,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib-detect.sh
 source "$SCRIPT_DIR/lib-detect.sh"
 
+# Directory of helper Python programs. These live as standalone files (rather
+# than inline heredocs) so python3 receives them via argv instead of a shell
+# heredoc pipe. On bash >= 5.1 a heredoc/here-string is written to a pipe
+# *before* the reader is exec'd; if the pipe buffer cannot grow (e.g. macOS
+# under pipe-KVA pressure) that pre-fork write blocks forever, hanging the save
+# hook. Delivering programs via argv sidesteps that failure mode entirely.
+PY_DIR="$SCRIPT_DIR/py"
+
 STATE_DIR="${TMUX_ASSISTANT_RESURRECT_DIR:-${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/tmux-assistant-resurrect}"
 # Follow tmux-resurrect's own save-dir resolution (see resurrect_data_dir in
 # lib-detect.sh) instead of hardcoding ~/.tmux/resurrect, so our sidecar lands
@@ -40,6 +48,18 @@ RESURRECT_DIR="$(resurrect_data_dir)"
 OUTPUT_FILE="${RESURRECT_DIR}/assistant-sessions.json"
 LOG_FILE="${RESURRECT_DIR}/assistant-save.log"
 CAPTURE_ENV=$(tmux show-option -gqv @assistant-resurrect-capture-env 2>/dev/null || true)
+
+# Watchdog deadline (seconds). Defense-in-depth: even without heredoc pipes, a
+# subprocess (python3 on a locked sqlite, a stat on a slow filesystem, a wedged
+# tmux call) could still hang the save hook. The watchdog guarantees bounded
+# completion and prevents blocked processes from accumulating. Configurable via
+# the tmux option or the env var; set to 0 to disable. Default: 60s (continuum
+# saves every 5 min, and a normal save finishes in a few seconds even at scale).
+SAVE_TIMEOUT=$(tmux show-option -gqv @assistant-resurrect-save-timeout 2>/dev/null || true)
+SAVE_TIMEOUT="${SAVE_TIMEOUT:-${ASSISTANT_RESURRECT_SAVE_TIMEOUT:-60}}"
+case "$SAVE_TIMEOUT" in
+'' | *[!0-9]*) SAVE_TIMEOUT=60 ;;
+esac
 
 mkdir -p -m 0700 "$STATE_DIR"
 mkdir -p "$RESURRECT_DIR"
@@ -134,21 +154,7 @@ get_opencode_session() {
 	# wrong. To avoid this, launch with explicit session IDs: opencode -s <id>.
 	local db_file="${HOME}/.local/share/opencode/opencode.db"
 	if [ "$allow_db_fallback" = "1" ] && [ -n "$cwd" ] && [ -f "$db_file" ] && command -v python3 >/dev/null 2>&1; then
-		sid=$(python3 -c "
-import sqlite3, sys
-try:
-    conn = sqlite3.connect('file:' + sys.argv[1] + '?mode=ro', uri=True)
-    cur = conn.cursor()
-    cur.execute(
-        'SELECT id FROM session WHERE directory = ? ORDER BY time_updated DESC LIMIT 1',
-        (sys.argv[2],))
-    row = cur.fetchone()
-    if row:
-        print(row[0])
-    conn.close()
-except Exception:
-    pass
-" "$db_file" "$cwd" 2>/dev/null || true)
+		sid=$(python3 "$PY_DIR/opencode_db.py" "$db_file" "$cwd" 2>/dev/null || true)
 		if [ -n "$sid" ]; then
 			echo "$sid"
 			return
@@ -202,62 +208,7 @@ get_codex_session() {
 		local process_start
 		process_start=$(get_process_start_epoch "$child_pid")
 		sid=$(
-			USED_CODEX_SESSION_IDS="$USED_CODEX_SESSION_IDS" python3 - "$HOME/.codex" "$cwd" "$process_start" <<'PY'
-import glob, os, sqlite3, sys
-
-codex_home = sys.argv[1]
-cwd = sys.argv[2]
-start_raw = sys.argv[3].strip()
-used = {sid for sid in os.environ.get("USED_CODEX_SESSION_IDS", "").split("\t") if sid}
-
-# Find the newest state_*.sqlite by mtime.
-dbs = sorted(glob.glob(os.path.join(codex_home, "state_*.sqlite")),
-             key=os.path.getmtime, reverse=True)
-if not dbs:
-    sys.exit(0)
-
-# Absolute epoch of the assistant process start (empty on platforms where it
-# can't be determined, in which case matching falls back to most-recent).
-try:
-    process_start = float(start_raw) if start_raw else None
-except ValueError:
-    process_start = None
-
-# Open read-only so we never conflict with a running codex writer.
-try:
-    con = sqlite3.connect(f"file:{dbs[0]}?mode=ro", uri=True)
-except sqlite3.Error:
-    sys.exit(0)
-
-try:
-    cur = con.cursor()
-    cur.execute(
-        "SELECT id, updated_at FROM threads "
-        "WHERE cwd = ? AND archived = 0 "
-        "ORDER BY updated_at DESC",
-        (cwd,),
-    )
-    rows = cur.fetchall()
-finally:
-    con.close()
-
-# Prefer threads whose last update happened after the process started
-# (rules out stale threads in the same cwd). Fall back to most-recent
-# overall if nothing qualifies — covers the edge case where a session
-# was spawned but hasn't had any user turns yet.
-def pick(rows, require_after_start):
-    for sid, updated_at in rows:
-        if sid in used:
-            continue
-        if require_after_start and process_start is not None and updated_at < process_start:
-            continue
-        return sid
-    return None
-
-sid = pick(rows, require_after_start=True) or pick(rows, require_after_start=False)
-if sid:
-    print(sid)
-PY
+			USED_CODEX_SESSION_IDS="$USED_CODEX_SESSION_IDS" python3 "$PY_DIR/codex_state_db.py" "$HOME/.codex" "$cwd" "$process_start"
 		)
 		if [ -n "$sid" ]; then
 			echo "$sid"
@@ -281,73 +232,7 @@ PY
 		local process_start
 		process_start=$(get_process_start_epoch "$child_pid")
 		sid=$(
-			USED_CODEX_SESSION_IDS="$USED_CODEX_SESSION_IDS" python3 - "$sessions_root" "$cwd" "$process_start" <<'PY'
-import datetime, json, os, sys
-
-sessions_root = sys.argv[1]
-cwd = sys.argv[2]
-start_raw = sys.argv[3].strip()
-used = {sid for sid in os.environ.get("USED_CODEX_SESSION_IDS", "").split("\t") if sid}
-
-try:
-    process_start = float(start_raw) if start_raw else None
-except ValueError:
-    process_start = None
-
-def parse_ts(value):
-    if not value:
-        return None
-    try:
-        return datetime.datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
-    except Exception:
-        return None
-
-candidates = []
-for root, _, files in os.walk(sessions_root):
-    for name in files:
-        if not name.endswith(".jsonl"):
-            continue
-        path = os.path.join(root, name)
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                first = f.readline()
-            if not first:
-                continue
-            record = json.loads(first)
-            if record.get("type") != "session_meta":
-                continue
-            payload = record.get("payload") or {}
-            if payload.get("cwd") != cwd:
-                continue
-            sid = payload.get("id")
-            if not sid:
-                continue
-            candidates.append((sid, parse_ts(payload.get("timestamp")), os.path.getmtime(path)))
-        except Exception:
-            continue
-
-if not candidates:
-    sys.exit(0)
-
-def score(item):
-    sid, session_start, mtime = item
-    reused = sid in used
-    if process_start is None or session_start is None:
-        prior = 0
-        distance = float("inf")
-    else:
-        prior = 1 if session_start <= process_start + 120 else 0
-        distance = abs(process_start - session_start)
-    return (
-        0 if reused else 1,
-        prior,
-        -distance,
-        mtime,
-    )
-
-best = max(candidates, key=score)
-print(best[0])
-PY
+			USED_CODEX_SESSION_IDS="$USED_CODEX_SESSION_IDS" python3 "$PY_DIR/codex_rollout.py" "$sessions_root" "$cwd" "$process_start"
 		)
 		if [ -n "$sid" ]; then
 			echo "$sid"
@@ -406,10 +291,7 @@ resolve_path_against() {
 		;;
 	*)
 		if command -v python3 >/dev/null 2>&1; then
-			python3 - "$base" "$path" <<'PY'
-import os, sys
-print(os.path.abspath(os.path.join(sys.argv[1], sys.argv[2])))
-PY
+			python3 "$PY_DIR/resolve_path.py" "$base" "$path"
 		else
 			echo "${base%/}/$path"
 		fi
@@ -421,32 +303,7 @@ jsonl_session_id_from_file() {
 	local session_file="$1"
 	[ -f "$session_file" ] || return 0
 	command -v python3 >/dev/null 2>&1 || return 0
-	python3 - "$session_file" <<'PY'
-import json, sys
-
-try:
-    with open(sys.argv[1], "r", encoding="utf-8") as f:
-        first = f.readline()
-        second = f.readline()
-except Exception:
-    sys.exit(0)
-
-for raw in (first, second if first else ""):
-    if not raw:
-        continue
-    try:
-        header = json.loads(raw)
-    except Exception:
-        continue
-    if header.get("type") == "title":
-        continue
-    if header.get("type") != "session":
-        sys.exit(0)
-    sid = header.get("id")
-    if isinstance(sid, str) and sid:
-        print(sid)
-    sys.exit(0)
-PY
+	python3 "$PY_DIR/jsonl_header_sid.py" "$session_file"
 }
 
 select_jsonl_session_id() {
@@ -458,93 +315,9 @@ select_jsonl_session_id() {
 	[ "$#" -gt 0 ] || return 0
 	command -v python3 >/dev/null 2>&1 || return 0
 
-	local process_start
-	process_start=$(get_process_start_epoch "$child_pid")
-	python3 - "$cwd" "$process_start" "$used_ids" "$@" <<'PY'
-import datetime, glob, json, os, sys
-
-cwd = sys.argv[1]
-start_raw = sys.argv[2].strip()
-used = {sid for sid in sys.argv[3].split("\t") if sid}
-session_dirs = []
-seen_dirs = set()
-for session_dir in sys.argv[4:]:
-    if not session_dir or not os.path.isdir(session_dir):
-        continue
-    key = os.path.abspath(session_dir)
-    if key in seen_dirs:
-        continue
-    seen_dirs.add(key)
-    session_dirs.append(session_dir)
-
-try:
-    process_start = float(start_raw) if start_raw else None
-except ValueError:
-    process_start = None
-
-def parse_ts(value):
-    if not value:
-        return None
-    try:
-        return datetime.datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
-    except Exception:
-        return None
-
-def read_logical_header(path):
-    with open(path, "r", encoding="utf-8") as f:
-        first = f.readline()
-        second = f.readline()
-    for raw in (first, second if first else ""):
-        if not raw:
-            continue
-        header = json.loads(raw)
-        if header.get("type") == "title":
-            continue
-        return header
-    return None
-
-candidates = []
-for session_dir in session_dirs:
-    for path in glob.glob(os.path.join(session_dir, "*.jsonl")):
-        try:
-            header = read_logical_header(path)
-            if not header or header.get("type") != "session":
-                continue
-            sid = header.get("id")
-            if not sid:
-                continue
-            header_cwd = header.get("cwd")
-            if isinstance(header_cwd, str) and header_cwd and header_cwd != cwd:
-                continue
-            candidates.append((sid, parse_ts(header.get("timestamp")), os.path.getmtime(path)))
-        except Exception:
-            continue
-
-if not candidates:
-    sys.exit(0)
-
-def score(item):
-    sid, created_at, mtime = item
-    reused = sid in used
-    if process_start is None:
-        active = 0
-        prior = 0
-        distance = float("inf")
-    else:
-        active = 1 if mtime >= process_start - 300 else 0
-        prior = 1 if created_at is not None and created_at <= process_start + 120 else 0
-        distance = abs(process_start - created_at) if created_at is not None else float("inf")
-    return (
-        0 if reused else 1,
-        active,
-        prior,
-        -distance,
-        mtime,
-    )
-
-best = max(candidates, key=score)
-print(best[0])
-PY
+	local etimes
+	etimes=$(ps -o etimes= -p "$child_pid" 2>/dev/null | tr -d ' ' || true)
+	python3 "$PY_DIR/select_jsonl_session.py" "$cwd" "$process_start" "$used_ids" "$@"
 }
 
 get_pi_session() {
@@ -743,7 +516,7 @@ get_omp_session() {
 	session_root=$(omp_session_root "$profile")
 	while IFS= read -r dir_name; do
 		[ -n "$dir_name" ] && session_dirs+=("${session_root}/${dir_name}")
-	done <<<"$(omp_session_dir_names "$lookup_cwd")"
+	done < <(omp_session_dir_names "$lookup_cwd")
 	sid=$(select_jsonl_session_id "$child_pid" "$lookup_cwd" "$USED_OMP_SESSION_IDS" "${session_dirs[@]}")
 	if [ -n "$sid" ]; then
 		echo "$sid"
@@ -961,8 +734,11 @@ read_process_env() {
 		case " $CAPTURE_ENV " in
 		*" $name "*)
 			value="${entry#*=}"
-			env_json=$(jq -c --arg key "$name" --arg value "$value" \
-				'. + {($key): $value}' <<<"$env_json")
+			# Feed the accumulator through a pipe (concurrent reader) rather
+			# than a here-string: a `<<<` write happens before jq is exec'd and
+			# can block if the pipe buffer cannot grow (see PY_DIR note above).
+			env_json=$(printf '%s' "$env_json" | jq -c --arg key "$name" --arg value "$value" \
+				'. + {($key): $value}')
 			;;
 		esac
 	done <&3
@@ -1077,7 +853,7 @@ _discover_session_flags() {
 			short=$(echo "$line" | grep -oE '(^|\s|,\s*)-[a-zA-Z](\s|,|$)' | grep -oE '\-[a-zA-Z]' | head -1 || true)
 			result="${result}${long}${short:+ ${short}}
 "
-		done <<<"$(echo "$help_out" | grep -E '^\s+(-[a-zA-Z],\s+)?--')"
+		done < <(echo "$help_out" | grep -E '^\s+(-[a-zA-Z],\s+)?--')
 	fi
 
 	if [ -n "$fallback" ]; then
@@ -1184,7 +960,7 @@ _warm_session_discovery() {
 		if [ -n "${!sub_pat:-}" ]; then
 			_discover_session_subcmds "$tool" "${!sub_pat}" >/dev/null
 		fi
-	done <<<"$(printf '%s\n' "$matches" | cut -f2 | sort -u)"
+	done < <(printf '%s\n' "$matches" | cut -f2 | sort -u)
 	return 0
 }
 
@@ -1237,7 +1013,7 @@ extract_cli_args() {
 				short="${short# }"
 				args=$(_strip_long_opt "$long" "$args")
 				[ -n "$short" ] && args=$(_strip_short_opt "$short" "$args")
-			done <<< "$flags"
+			done < <(printf '%s\n' "$flags")
 		fi
 	fi
 
@@ -1246,7 +1022,7 @@ extract_cli_args() {
 		local -a confirmed_subcmds=()
 		while IFS= read -r subcmd; do
 			[ -n "$subcmd" ] && confirmed_subcmds+=("$subcmd")
-		done <<<"$(_discover_session_subcmds "$tool" "$subcmd_pattern")"
+		done < <(_discover_session_subcmds "$tool" "$subcmd_pattern")
 		if [ "${#confirmed_subcmds[@]}" -gt 0 ]; then
 			args=$(_strip_subcmds "$args" "${confirmed_subcmds[@]}")
 			# Strip subcommand-specific picker flags (e.g. codex resume --last)
@@ -1362,12 +1138,82 @@ resolve_pane_candidates() {
 				resolved=1
 				break
 			fi
-		done <<<"$pane_candidates"
+		done < <(printf '%s\n' "$pane_candidates")
 	done
 
 	if [ "$resolved" -eq 0 ] && [ -n "$first_tool" ]; then
 		log "detected $first_tool in $pane_target (pid $first_pid) but no session ID available"
 	fi
+}
+
+# --- Watchdog (defense-in-depth) ---
+
+# Print root plus all of its descendant PIDs, one per line, from a fresh ps
+# snapshot. Portable across macOS and Linux (no pgrep/pkill/setsid needed).
+# The fixpoint loop over the parent map handles arbitrary tree depth regardless
+# of the order ps lists processes in.
+descendant_pids() {
+	local root="$1"
+	ps -eo pid=,ppid= 2>/dev/null | awk -v root="$root" '
+		{ pid[NR] = $1; parent[$1] = $2 }
+		END {
+			seen[root] = 1
+			changed = 1
+			while (changed) {
+				changed = 0
+				for (i = 1; i <= NR; i++) {
+					p = pid[i]
+					if (!(p in seen) && (parent[p] in seen)) {
+						seen[p] = 1
+						changed = 1
+					}
+				}
+			}
+			for (p in seen) print p
+		}'
+}
+
+# Signal every descendant of $root (NOT $root itself, and never $skip — the
+# watchdog's own PID) with $sig. Best-effort: races where a PID already exited
+# are ignored.
+reap_descendants() {
+	local root="$1" skip="$2" sig="$3" pid
+	for pid in $(descendant_pids "$root"); do
+		[ "$pid" = "$root" ] && continue
+		[ "$pid" = "$skip" ] && continue
+		kill "-$sig" "$pid" 2>/dev/null || true
+	done
+}
+
+# Background watchdog: after SAVE_TIMEOUT seconds, reap the hung worker
+# subprocesses (python3/jq/tmux/…) so the save hook cannot block forever or
+# leave stuck processes behind. It reaps descendants rather than the main shell:
+# once the wedged child dies, main unblocks from its command substitution and
+# finishes on its own. TERM first, then KILL for anything that ignores it.
+save_watchdog() {
+	local target="$1" selffile="$2" self=""
+	# A signal-kill (normal-exit cleanup) terminates this subshell outright and
+	# skips the reap. `|| exit 0` only guards a non-signal early return.
+	sleep "$SAVE_TIMEOUT" || exit 0
+	# Learn our own PID (written by main after fork) so we never reap ourselves.
+	# bash 3.2 has no $BASHPID, and a subshell's $$ is the parent's, so main
+	# hands us our PID through this file instead.
+	[ -f "$selffile" ] && self=$(cat "$selffile" 2>/dev/null || true)
+	log "save hook exceeded ${SAVE_TIMEOUT}s; reaping stuck subprocesses (watchdog)"
+	reap_descendants "$target" "$self" TERM
+	sleep 2 || exit 0
+	reap_descendants "$target" "$self" KILL
+}
+
+# Stop the watchdog and its sleep child on normal completion.
+stop_save_watchdog() {
+	[ -n "${WATCHDOG_PID:-}" ] || return 0
+	# Kill the watchdog subshell first (so it cannot report its own sleep child
+	# being terminated), then mop up that sleep child. pkill -P is present on
+	# macOS and Linux; if absent, the orphaned sleep simply expires on its own.
+	kill "$WATCHDOG_PID" 2>/dev/null || true
+	pkill -P "$WATCHDOG_PID" 2>/dev/null || true
+	WATCHDOG_PID=""
 }
 
 # --- Main ---
@@ -1377,7 +1223,21 @@ main() {
 	PANE_FILE=$(mktemp)
 	PARTS_FILE=$(mktemp)
 	STATE_CACHE_FILE=$(mktemp)
-	trap 'rm -f "$PS_FILE" "$PANE_FILE" "$PARTS_FILE" "$STATE_CACHE_FILE"' EXIT INT TERM
+	WATCHDOG_PID=""
+	WATCHDOG_SELF_FILE=""
+	trap 'rm -f "$PS_FILE" "$PANE_FILE" "$PARTS_FILE" "$STATE_CACHE_FILE" "${WATCHDOG_SELF_FILE:-}"; stop_save_watchdog' EXIT INT TERM
+
+	# Arm the watchdog (unless disabled with a 0/invalid timeout).
+	if [ "$SAVE_TIMEOUT" -gt 0 ]; then
+		WATCHDOG_SELF_FILE=$(mktemp)
+		save_watchdog "$$" "$WATCHDOG_SELF_FILE" &
+		WATCHDOG_PID=$!
+		# Hand the watchdog its own PID (so it can exclude itself when reaping),
+		# then drop it from the job table so a normal-exit kill doesn't emit a
+		# "Terminated" job notification onto the hook's stderr.
+		echo "$WATCHDOG_PID" >"$WATCHDOG_SELF_FILE"
+		disown "$WATCHDOG_PID" 2>/dev/null || true
+	fi
 
 	# Timestamp for the JSON output envelope
 	local SAVE_TS
@@ -1548,7 +1408,7 @@ main() {
 			# Candidate tuples are US-delimited; a literal \x1f inside process args
 			# would break parsing, but this is practically unlikely for CLI argv.
 			pane_candidates="${pane_candidates}${tool}${US}${cpid}${US}${cargs}"$'\n'
-		done <<<"$MATCHES"
+		done < <(printf '%s\n' "$MATCHES")
 
 		# Process final pane candidate list.
 		if [ -n "$current_target" ] && [ -n "$pane_candidates" ]; then
@@ -1615,7 +1475,7 @@ strip_assistant_pane_contents() {
 			rm -f "$content_file"
 			removed=$((removed + 1))
 		fi
-	done <<<"$panes"
+	done < <(printf '%s\n' "$panes")
 
 	if [ "$removed" -gt 0 ]; then
 		if tar cf - -C "$tmpdir" ./pane_contents/ | gzip >"${archive}.tmp" 2>/dev/null; then

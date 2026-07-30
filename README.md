@@ -148,6 +148,8 @@ scripts/
   lib-detect.sh                   # Shared library (detect_tool, pane_has_assistant, posix_quote)
   save-assistant-sessions.sh      # Resurrect post-save hook (process detection + session IDs)
   restore-assistant-sessions.sh   # Resurrect post-restore hook (resumes assistants)
+  py/                             # Helper programs invoked by the save hook via argv
+                                  #   (never via shell heredocs — see issue #48)
 test/
   Dockerfile                      # Docker image with tmux, jq, just, and real assistant CLIs
   bench-save-hook.sh              # Single-scenario save-hook benchmark runner (inside Docker)
@@ -447,6 +449,23 @@ Edit `config/resurrect-assistants.conf`:
 set -g @continuum-save-interval '5'  # minutes
 ```
 
+### Save-hook timeout (watchdog)
+
+The save hook is guarded by a watchdog that guarantees it terminates within a
+bounded time and never leaves blocked subprocesses behind, even if a helper
+(`python3` on a locked database, a stat on a slow filesystem, a wedged `tmux`
+call) hangs. The default deadline is 60 seconds; a normal save finishes in a few
+seconds even with many panes. To change it:
+
+```bash
+set -g @assistant-resurrect-save-timeout '90'   # seconds; 0 disables the watchdog
+```
+
+It can also be set via the `ASSISTANT_RESURRECT_SAVE_TIMEOUT` environment
+variable (the tmux option takes precedence). When the deadline is exceeded the
+watchdog reaps the stuck worker processes — first with `SIGTERM`, then `SIGKILL`
+— and logs the event to `assistant-save.log`.
+
 ### Adding support for a new assistant
 
 To add a new AI coding assistant:
@@ -519,6 +538,14 @@ matching binary names. Then extracts session IDs using tool-specific methods
 
 Writes everything to `assistant-sessions.json` in tmux-resurrect's save
 directory (see **Save location** above).
+
+Helper programs (SQLite/JSONL lookups, path resolution) live as standalone
+files under `scripts/py/` and are handed to `python3` via argv. They are
+deliberately **not** embedded as shell heredocs: on bash ≥ 5.1 a heredoc is
+written to a pipe before its reader is exec'd, and on macOS under pipe-memory
+pressure that write can block forever, hanging the hook (issue #48). A watchdog
+(see **Save-hook timeout** above) bounds total runtime as a second line of
+defense.
 
 ### Restore hook (`scripts/restore-assistant-sessions.sh`)
 
