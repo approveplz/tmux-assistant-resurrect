@@ -463,8 +463,12 @@ set -g @assistant-resurrect-save-timeout '90'   # seconds; 0 disables the watchd
 
 It can also be set via the `ASSISTANT_RESURRECT_SAVE_TIMEOUT` environment
 variable (the tmux option takes precedence). When the deadline is exceeded the
-watchdog reaps the stuck worker processes — first with `SIGTERM`, then `SIGKILL`
-— and logs the event to `assistant-save.log`.
+watchdog first `SIGTERM`s the stuck worker subprocesses so a merely-wedged save
+can unblock and finish; if the hook is still running shortly after, it escalates
+to `SIGKILL` and terminates the save hook itself, bounding total runtime. The
+sidecar `assistant-sessions.json` is written atomically (temp file + rename), so
+a terminated or failed save never corrupts the previously saved sessions. Hard
+timeouts are logged to `assistant-save.log`.
 
 ### Adding support for a new assistant
 

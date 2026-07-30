@@ -3776,12 +3776,11 @@ echo "=== Test 12: watchdog bounds runtime and reaps stuck workers ==="
 echo ""
 
 WD_HELPER="$(mktemp)"
-WD_DIR="$(mktemp -d)"
 # Runs in its own process so reaping its descendants can't touch the harness.
 cat >"$WD_HELPER" <<WDEOF
 #!/usr/bin/env bash
 set -euo pipefail
-dir="\$1"
+dir="\$1"; mode="\${2:-normal}"
 export TMUX_ASSISTANT_RESURRECT_DIR="\$dir/state"
 export TMUX_RESURRECT_DIR="\$dir/resurrect"
 mkdir -p "\$dir/state" "\$dir/resurrect"
@@ -3789,14 +3788,13 @@ tmux() { return 0; }
 source "$SAVE_SCRIPT"
 LOG_FILE="\$dir/wd.log"; : >"\$LOG_FILE"
 
-# 1) descendant_pids enumerates a live child; reap_descendants terminates it.
+# descendant_pids enumerates a live child; reap_descendants terminates it.
 sleep 30 & child=\$!
 descendant_pids "\$\$" | grep -qx "\$child" && echo "DESC_OK" || echo "DESC_FAIL"
 reap_descendants "\$\$" "" TERM
 sleep 0.5
 kill -0 "\$child" 2>/dev/null && { echo "REAP_FAIL"; kill "\$child" 2>/dev/null; } || echo "REAP_OK"
 
-# 2) End-to-end: a wedged command substitution is bounded by the watchdog.
 SAVE_TIMEOUT=2
 selffile=\$(mktemp)
 save_watchdog "\$\$" "\$selffile" &
@@ -3804,12 +3802,19 @@ WATCHDOG_PID=\$!
 echo "\$WATCHDOG_PID" >"\$selffile"
 disown "\$WATCHDOG_PID" 2>/dev/null || true
 start=\$SECONDS
-x=\$(sleep 30; echo done) || true
+if [ "\$mode" = hard ]; then
+	# Worker ignores SIGTERM, forcing the SIGKILL + kill-main hard-deadline path.
+	x=\$(bash -c 'trap "" TERM; while :; do sleep 1; done') || true
+else
+	x=\$(sleep 30) || true
+fi
 echo "ELAPSED=\$((SECONDS - start))"
 stop_save_watchdog
 WDEOF
 
-wd_out=$(bash "$WD_HELPER" "$WD_DIR" 2>/dev/null || true)
+# Normal mode: the watchdog TERMs the wedged worker so main unblocks in time.
+WD_DIR="$(mktemp -d)"
+wd_out=$(bash "$WD_HELPER" "$WD_DIR" normal 2>/dev/null || true)
 assert_contains "descendant_pids enumerates a live child" "$wd_out" "DESC_OK"
 assert_contains "reap_descendants terminates a descendant" "$wd_out" "REAP_OK"
 wd_elapsed=$(echo "$wd_out" | sed -n 's/^ELAPSED=//p')
@@ -3818,10 +3823,49 @@ if [ -n "$wd_elapsed" ] && [ "$wd_elapsed" -le 5 ]; then
 else
 	fail "watchdog did not bound runtime (elapsed='${wd_elapsed}', output='$wd_out')"
 fi
-assert_contains "watchdog logs the timeout reap" "$(cat "$WD_DIR/wd.log" 2>/dev/null)" "reaping stuck subprocesses"
+rm -rf "$WD_DIR"
+
+# Hard mode: a hook that ignores SIGTERM must still be force-terminated (true
+# total-runtime deadline) and the event logged. Bounded wait so a broken
+# watchdog fails the test instead of hanging the suite.
+HARD_DIR="$(mktemp -d)"
+bash "$WD_HELPER" "$HARD_DIR" hard >/dev/null 2>&1 &
+hard_pid=$!
+hard_bounded=0
+for _i in $(seq 1 20); do
+	kill -0 "$hard_pid" 2>/dev/null || { hard_bounded=1; break; }
+	sleep 0.5
+done
+if [ "$hard_bounded" -eq 1 ]; then
+	pass "watchdog enforces a hard deadline on a TERM-ignoring hook"
+else
+	fail "watchdog failed to terminate a TERM-ignoring hook within ~10s"
+	kill -9 "$hard_pid" 2>/dev/null || true
+fi
+wait "$hard_pid" 2>/dev/null || true
+sleep 1  # let the orphaned watchdog flush its post-kill log
+assert_contains "watchdog logs the hard timeout" "$(cat "$HARD_DIR/wd.log" 2>/dev/null)" "terminated stuck save"
+rm -rf "$HARD_DIR"
+
+# Atomic output: a failing serializer must not destroy the previous sidecar.
+ATOMIC_DIR="$(mktemp -d)"
+atomic_out=$(bash -c '
+	set -euo pipefail
+	export TMUX_ASSISTANT_RESURRECT_DIR="'"$ATOMIC_DIR"'/state"
+	export TMUX_RESURRECT_DIR="'"$ATOMIC_DIR"'/resurrect"
+	mkdir -p "$TMUX_ASSISTANT_RESURRECT_DIR" "$TMUX_RESURRECT_DIR"
+	tmux() { return 0; }
+	source "'"$SAVE_SCRIPT"'"
+	printf "%s" "{\"sentinel\":\"KEEP\"}" >"$OUTPUT_FILE"
+	jq() { return 1; }
+	SAVE_TIMEOUT=0
+	main >/dev/null 2>&1 || true
+	cat "$OUTPUT_FILE"
+' 2>/dev/null || true)
+assert_contains "failing serializer preserves the previous sidecar" "$atomic_out" "KEEP"
+rm -rf "$ATOMIC_DIR"
 
 rm -f "$WD_HELPER"
-rm -rf "$WD_DIR"
 
 # --- Summary ---
 

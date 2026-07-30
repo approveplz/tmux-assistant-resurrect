@@ -1173,25 +1173,47 @@ descendant_pids() {
 		}'
 }
 
-# Signal every descendant of $root (NOT $root itself, and never $skip — the
-# watchdog's own PID) with $sig. Best-effort: races where a PID already exited
-# are ignored.
-reap_descendants() {
-	local root="$1" skip="$2" sig="$3" pid
-	for pid in $(descendant_pids "$root"); do
-		[ "$pid" = "$root" ] && continue
-		[ "$pid" = "$skip" ] && continue
+# Send signal $1 to each remaining PID in $2.. (best-effort; already-exited
+# PIDs are ignored). Takes an explicit list so a caller can capture a PID set
+# once and signal that exact set later, even if the tree has since changed.
+signal_pids() {
+	local sig="$1" pid
+	shift
+	for pid in "$@"; do
 		kill "-$sig" "$pid" 2>/dev/null || true
 	done
 }
 
-# Background watchdog: after SAVE_TIMEOUT seconds, reap the hung worker
-# subprocesses (python3/jq/tmux/…) so the save hook cannot block forever or
-# leave stuck processes behind. It reaps descendants rather than the main shell:
-# once the wedged child dies, main unblocks from its command substitution and
-# finishes on its own. TERM first, then KILL for anything that ignores it.
+# Space-separated descendants of $root, excluding $root itself and $skip (the
+# watchdog's own PID).
+victim_pids() {
+	local root="$1" skip="$2" pid out=""
+	for pid in $(descendant_pids "$root"); do
+		[ "$pid" = "$root" ] && continue
+		[ "$pid" = "$skip" ] && continue
+		out="$out $pid"
+	done
+	printf '%s' "$out"
+}
+
+# Reap every descendant of $root once (NOT $root, never $skip). Retained as a
+# tested one-shot utility; save_watchdog uses the snapshot-based logic below.
+reap_descendants() {
+	local root="$1" skip="$2" sig="$3"
+	# shellcheck disable=SC2086
+	signal_pids "$sig" $(victim_pids "$root" "$skip")
+}
+
+# Background watchdog: a bounded hard deadline for the whole save hook. After
+# SAVE_TIMEOUT seconds it SIGTERMs the current worker subprocesses so a wedged
+# command substitution unblocks and main can finish cleanly. If the hook is
+# still alive after a short grace period it escalates to SIGKILL — over both the
+# original victim set (covering children reparented away by the TERM) and a
+# fresh snapshot (covering workers spawned since) — and finally kills main
+# itself, so the hook can never run past the deadline regardless of what it does
+# after the first reap.
 save_watchdog() {
-	local target="$1" selffile="$2" self=""
+	local target="$1" selffile="$2" self="" victims fresh
 	# A signal-kill (normal-exit cleanup) terminates this subshell outright and
 	# skips the reap. `|| exit 0` only guards a non-signal early return.
 	sleep "$SAVE_TIMEOUT" || exit 0
@@ -1199,20 +1221,34 @@ save_watchdog() {
 	# bash 3.2 has no $BASHPID, and a subshell's $$ is the parent's, so main
 	# hands us our PID through this file instead.
 	[ -f "$selffile" ] && self=$(cat "$selffile" 2>/dev/null || true)
-	log "save hook exceeded ${SAVE_TIMEOUT}s; reaping stuck subprocesses (watchdog)"
-	reap_descendants "$target" "$self" TERM
+
+	# Round 1: TERM the current workers. Do this BEFORE logging — the log write
+	# touches RESURRECT_DIR, which may be the very filesystem that is stalled.
+	victims=$(victim_pids "$target" "$self")
+	# shellcheck disable=SC2086
+	signal_pids TERM $victims
 	sleep 2 || exit 0
-	reap_descendants "$target" "$self" KILL
+
+	# If the hook already finished on its own, the TERM was enough.
+	if kill -0 "$target" 2>/dev/null; then
+		fresh=$(victim_pids "$target" "$self")
+		# shellcheck disable=SC2086
+		signal_pids KILL $victims $fresh
+		kill -KILL "$target" 2>/dev/null || true
+	fi
+
+	# Log last, best-effort: everything is already signalled, so a blocking log
+	# write can no longer prevent the deadline from being enforced.
+	log "save hook exceeded ${SAVE_TIMEOUT}s; terminated stuck save (watchdog)"
 }
 
-# Stop the watchdog and its sleep child on normal completion.
+# Stop the watchdog and its sleep child on normal completion. Snapshot the
+# watchdog subtree first, then signal the captured PIDs, so a sleep child that
+# gets reparented between the two steps is still killed by PID (no orphans).
 stop_save_watchdog() {
 	[ -n "${WATCHDOG_PID:-}" ] || return 0
-	# Kill the watchdog subshell first (so it cannot report its own sleep child
-	# being terminated), then mop up that sleep child. pkill -P is present on
-	# macOS and Linux; if absent, the orphaned sleep simply expires on its own.
-	kill "$WATCHDOG_PID" 2>/dev/null || true
-	pkill -P "$WATCHDOG_PID" 2>/dev/null || true
+	# shellcheck disable=SC2046
+	signal_pids TERM $(descendant_pids "$WATCHDOG_PID")
 	WATCHDOG_PID=""
 }
 
@@ -1225,7 +1261,7 @@ main() {
 	STATE_CACHE_FILE=$(mktemp)
 	WATCHDOG_PID=""
 	WATCHDOG_SELF_FILE=""
-	trap 'rm -f "$PS_FILE" "$PANE_FILE" "$PARTS_FILE" "$STATE_CACHE_FILE" "${WATCHDOG_SELF_FILE:-}"; stop_save_watchdog' EXIT INT TERM
+	trap 'rm -f "$PS_FILE" "$PANE_FILE" "$PARTS_FILE" "$STATE_CACHE_FILE" "${WATCHDOG_SELF_FILE:-}" "${OUTPUT_FILE}.tmp.$$"; stop_save_watchdog' EXIT INT TERM
 
 	# Arm the watchdog (unless disabled with a 0/invalid timeout).
 	if [ "$SAVE_TIMEOUT" -gt 0 ]; then
@@ -1416,18 +1452,32 @@ main() {
 		fi
 	fi
 
-	# Single jq: convert TSV to JSON array + build final output (replaces N+3 jq calls)
+	# Single jq: convert TSV to JSON array + build final output (replaces N+3 jq calls).
+	# Write to a temp file and rename into place so a failed or watchdog-killed jq
+	# leaves the previous valid sidecar intact (a bare `>"$OUTPUT_FILE"` truncates
+	# it before jq runs, which would lose all saved sessions on a timeout).
 	local count=0
+	local OUTPUT_TMP="${OUTPUT_FILE}.tmp.$$"
 	if [ -s "$PARTS_FILE" ]; then
-		jq -Rs --arg ts "$SAVE_TS" '
+		if jq -Rs --arg ts "$SAVE_TS" '
 			split("\n") | map(select(length > 0) | split("\t") |
 			{pane:.[0], tool:.[1], session_id:.[2], cwd:.[3], pid:.[4], model:.[5], cli_args:.[6],
 			 env:(.[7] // "null" | try fromjson catch null)})
 			| {timestamp: $ts, sessions: .}
-		' "$PARTS_FILE" >"$OUTPUT_FILE"
-		count=$(jq '.sessions | length' "$OUTPUT_FILE")
+		' "$PARTS_FILE" >"$OUTPUT_TMP"; then
+			mv -f "$OUTPUT_TMP" "$OUTPUT_FILE"
+			count=$(jq '.sessions | length' "$OUTPUT_FILE")
+		else
+			rm -f "$OUTPUT_TMP"
+			log "warning: failed to serialize sessions; keeping previous $OUTPUT_FILE"
+			return 1
+		fi
 	else
-		jq -n --arg ts "$SAVE_TS" '{timestamp: $ts, sessions: []}' >"$OUTPUT_FILE"
+		if jq -n --arg ts "$SAVE_TS" '{timestamp: $ts, sessions: []}' >"$OUTPUT_TMP"; then
+			mv -f "$OUTPUT_TMP" "$OUTPUT_FILE"
+		else
+			rm -f "$OUTPUT_TMP"
+		fi
 	fi
 
 	log "saved $count assistant session(s) to $OUTPUT_FILE"
