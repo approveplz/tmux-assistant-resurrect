@@ -1213,27 +1213,41 @@ reap_descendants() {
 # itself, so the hook can never run past the deadline regardless of what it does
 # after the first reap.
 save_watchdog() {
-	local target="$1" selffile="$2" self="" victims fresh
+	local target="$1" selffile="$2" firedfile="$3" self="" victims fresh
 	# A signal-kill (normal-exit cleanup) terminates this subshell outright and
 	# skips the reap. `|| exit 0` only guards a non-signal early return.
 	sleep "$SAVE_TIMEOUT" || exit 0
+
+	# Mark ourselves "fired". From here on, stop_save_watchdog will NOT cancel
+	# us: once the deadline is reached we must run the escalation to completion,
+	# even if killing a worker lets main unblock and exit during the grace below.
+	# Otherwise a TERM-surviving grandchild reparented off that worker would be
+	# stranded when main's exit cancelled us mid-grace.
+	echo fired >"$firedfile" 2>/dev/null || true
+
 	# Learn our own PID (written by main after fork) so we never reap ourselves.
 	# bash 3.2 has no $BASHPID, and a subshell's $$ is the parent's, so main
 	# hands us our PID through this file instead.
 	[ -f "$selffile" ] && self=$(cat "$selffile" 2>/dev/null || true)
 
-	# Round 1: TERM the current workers. Do this BEFORE logging — the log write
-	# touches RESURRECT_DIR, which may be the very filesystem that is stalled.
+	# Round 1: TERM the current workers so a merely-wedged save can unblock and
+	# finish cleanly during the grace period.
 	victims=$(victim_pids "$target" "$self")
 	# shellcheck disable=SC2086
 	signal_pids TERM $victims
-	sleep 2 || exit 0
+	sleep 2 || true
 
-	# If the hook already finished on its own, the TERM was enough.
+	# Escalate the captured victims to SIGKILL UNCONDITIONALLY — a TERM survivor
+	# is a leak whether or not main recovered, and it may have been reparented
+	# away from main's tree (so it is no longer reachable from $target). Then, if
+	# the hook itself is still alive, also KILL any workers spawned since and the
+	# hook process, enforcing the hard deadline.
+	# shellcheck disable=SC2086
+	signal_pids KILL $victims
 	if kill -0 "$target" 2>/dev/null; then
 		fresh=$(victim_pids "$target" "$self")
 		# shellcheck disable=SC2086
-		signal_pids KILL $victims $fresh
+		signal_pids KILL $fresh
 		kill -KILL "$target" 2>/dev/null || true
 	fi
 
@@ -1246,11 +1260,17 @@ save_watchdog() {
 	echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] save hook exceeded ${SAVE_TIMEOUT}s; terminated stuck save (watchdog)" >&2
 }
 
-# Stop the watchdog and its sleep child on normal completion. Snapshot the
-# watchdog subtree first, then signal the captured PIDs, so a sleep child that
-# gets reparented between the two steps is still killed by PID (no orphans).
+# Stop the watchdog on normal completion. If it has already fired (reached the
+# deadline), leave it alone: it is escalating and must finish, and it will exit
+# on its own within the grace window. Otherwise snapshot the watchdog subtree
+# and signal the captured PIDs, so a sleep child reparented between the two
+# steps is still killed by PID (no orphans).
 stop_save_watchdog() {
 	[ -n "${WATCHDOG_PID:-}" ] || return 0
+	if [ -s "${WATCHDOG_FIRED_FILE:-/nonexistent}" ]; then
+		WATCHDOG_PID=""
+		return 0
+	fi
 	# shellcheck disable=SC2046
 	signal_pids TERM $(descendant_pids "$WATCHDOG_PID")
 	WATCHDOG_PID=""
@@ -1265,12 +1285,17 @@ main() {
 	STATE_CACHE_FILE=$(mktemp)
 	WATCHDOG_PID=""
 	WATCHDOG_SELF_FILE=""
-	trap 'rm -f "$PS_FILE" "$PANE_FILE" "$PARTS_FILE" "$STATE_CACHE_FILE" "${WATCHDOG_SELF_FILE:-}" "${OUTPUT_FILE}.tmp.$$"; stop_save_watchdog' EXIT INT TERM
+	WATCHDOG_FIRED_FILE=""
+	trap 'rm -f "$PS_FILE" "$PANE_FILE" "$PARTS_FILE" "$STATE_CACHE_FILE" "${WATCHDOG_SELF_FILE:-}" "${WATCHDOG_FIRED_FILE:-}" "${OUTPUT_FILE}.tmp.$$"; stop_save_watchdog' EXIT INT TERM
 
 	# Arm the watchdog (unless disabled with a 0/invalid timeout).
 	if [ "$SAVE_TIMEOUT" -gt 0 ]; then
 		WATCHDOG_SELF_FILE=$(mktemp)
-		save_watchdog "$$" "$WATCHDOG_SELF_FILE" &
+		WATCHDOG_FIRED_FILE=$(mktemp)  # empty until the watchdog reaches the deadline
+		# Detach the watchdog's stdout (>/dev/null) so, if it lingers after firing,
+		# it never holds the hook's stdout open and delay the caller. Its stderr is
+		# kept for the timeout diagnostic.
+		save_watchdog "$$" "$WATCHDOG_SELF_FILE" "$WATCHDOG_FIRED_FILE" >/dev/null &
 		WATCHDOG_PID=$!
 		# Hand the watchdog its own PID (so it can exclude itself when reaping),
 		# then drop it from the job table so a normal-exit kill doesn't emit a

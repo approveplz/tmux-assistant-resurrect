@@ -3797,17 +3797,31 @@ kill -0 "\$child" 2>/dev/null && { echo "REAP_FAIL"; kill "\$child" 2>/dev/null;
 
 SAVE_TIMEOUT=2
 selffile=\$(mktemp)
-save_watchdog "\$\$" "\$selffile" &
+WATCHDOG_FIRED_FILE=\$(mktemp)
+save_watchdog "\$\$" "\$selffile" "\$WATCHDOG_FIRED_FILE" >/dev/null &
 WATCHDOG_PID=\$!
 echo "\$WATCHDOG_PID" >"\$selffile"
 disown "\$WATCHDOG_PID" 2>/dev/null || true
 start=\$SECONDS
-if [ "\$mode" = hard ]; then
+case "\$mode" in
+hard)
 	# Worker ignores SIGTERM, forcing the SIGKILL + kill-main hard-deadline path.
 	x=\$(bash -c 'trap "" TERM; while :; do sleep 1; done') || true
-else
+	;;
+grandchild)
+	# The worker's parent dies on SIGTERM (unblocking main), leaving a
+	# TERM-ignoring grandchild that gets reparented away from main's tree. The
+	# fired watchdog must still SIGKILL it even though main recovers and exits.
+	x=\$(
+		bash -c 'trap "" TERM; while :; do sleep 1; done' >/dev/null 2>&1 &
+		echo "\$!" >"\$dir/grandchild.pid"
+		sleep 30
+	) || true
+	;;
+*)
 	x=\$(sleep 30) || true
-fi
+	;;
+esac
 echo "ELAPSED=\$((SECONDS - start))"
 stop_save_watchdog
 WDEOF
@@ -3848,6 +3862,21 @@ sleep 1  # let the orphaned watchdog flush its post-kill report
 # stalled filesystem and accumulate stuck watchdogs).
 assert_contains "watchdog reports the hard timeout on stderr" "$(cat "$HARD_DIR/err" 2>/dev/null)" "terminated stuck save"
 rm -rf "$HARD_DIR"
+
+# Grandchild leak: a TERM-ignoring grandchild reparented off a worker that main
+# was blocked on must still be SIGKILLed, even though killing the worker lets
+# main recover and exit (cancelling nothing — the watchdog is already "fired").
+GC_DIR="$(mktemp -d)"
+bash "$WD_HELPER" "$GC_DIR" grandchild >/dev/null 2>&1  # returns when main exits (~2s)
+sleep 4  # let the fired watchdog finish its grace + SIGKILL escalation
+gc_pid=$(cat "$GC_DIR/grandchild.pid" 2>/dev/null || true)
+if [ -n "$gc_pid" ] && kill -0 "$gc_pid" 2>/dev/null; then
+	fail "watchdog stranded a reparented TERM-ignoring grandchild (pid $gc_pid)"
+	kill -9 "$gc_pid" 2>/dev/null || true
+else
+	pass "watchdog kills a reparented TERM-ignoring grandchild after main recovers"
+fi
+rm -rf "$GC_DIR"
 
 # Atomic output: a failing serializer must not destroy the previous sidecar.
 ATOMIC_DIR="$(mktemp -d)"
