@@ -393,6 +393,20 @@ to `assistant-sessions.json`. On restore, variables listed in
 VIRTUAL_ENV='/home/user/.venv' claude --resume <session-id>
 ```
 
+**Tools without a session hook** (Codex, Pi, Oh My Pi, Grok) have no state file
+to capture from at launch. On **Linux and WSL**, the save hook instead reads the
+configured variables straight from each detected assistant's environment via
+`/proc/<pid>/environ`, so values like `CODEX_HOME` survive a restart. Only the
+variables you list in `@assistant-resurrect-capture-env` are read — nothing else
+is inspected — and where a value is available from both a session hook and the
+live process, the live process wins.
+
+> **Platform note:** Reading another process's environment is only possible
+> unprivileged on **Linux/WSL** (`/proc`). macOS withholds it even for your own
+> processes, so there hookless tools capture no env at save time. If you need a
+> fixed value on macOS, export it in your shell profile (the restored pane
+> inherits it) or set it globally with `tmux set-environment -g VAR value`.
+
 Built-in variables (`TMUX_PANE`, `SHELL`) are **not** restored — `TMUX_PANE`
 would be stale after restore, and `SHELL` is already in the environment.
 State files live in a user-only directory (mode 0700).
