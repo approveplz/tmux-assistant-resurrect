@@ -1184,7 +1184,7 @@ ROLLOUT
 ORIG_HOME="$HOME"
 HOME="$ROLLOUT_TEST_DIR"
 
-# Should find session by cwd match (use $$ as a live PID so ps -o etimes= works)
+# Should find session by cwd match (use $$ as a live PID so get_process_start_epoch works)
 rollout_sid=$(get_codex_session $$ "codex" "/tmp/test-project")
 assert_eq "Codex rollout session file lookup by cwd" "ses_rollout_aaa" "$rollout_sid"
 
@@ -1625,6 +1625,14 @@ if [ -r /proc/self/environ ]; then
 	UNIT_ENV_KEEP="keep me" UNIT_ENV_SECRET="do-not-capture" sleep 30 &
 	unit_env_pid=$!
 
+	# Wait until the child has execve'd sleep so /proc/PID/environ reflects the
+	# new environment. Reading between fork and exec sees the parent's environ
+	# (no UNIT_ENV_KEEP) and returns null — a race that flakes under CI load.
+	for _ in $(seq 1 100); do
+		grep -qz "UNIT_ENV_KEEP=keep me" "/proc/$unit_env_pid/environ" 2>/dev/null && break
+		sleep 0.05
+	done
+
 	CAPTURE_ENV="UNIT_ENV_KEEP"
 	unit_read=$(read_process_env "$unit_env_pid")
 	assert_eq "read_process_env captures whitelisted var (with spaces)" \
@@ -1658,6 +1666,63 @@ if [ -r /proc/self/environ ]; then
 else
 	echo "SKIP: /proc unavailable — process env capture is Linux/WSL-only"
 fi
+
+# --- Test 5c4d: process start-time helper (unit) ---
+#
+# get_process_start_epoch() backs Codex/Pi/OMP session matching: it distinguishes
+# the live assistant session from stale sessions sharing a cwd. It reads
+# /proc/PID/stat on Linux and elapsed time (`ps -o etime=`) on macOS/BSD (issue
+# #49 — the old `ps -o etimes=` was a GNU keyword BSD ps silently rejected).
+echo ""
+echo "=== Test 5c4d: process start-time helper unit tests ==="
+echo ""
+
+# Cross-platform: a freshly spawned process should report a start epoch that is
+# numeric and within a few seconds of now (covers /proc on Linux, etime on mac).
+sleep 30 &
+ps_unit_pid=$!
+ps_unit_now=$(date +%s)
+ps_unit_start=$(get_process_start_epoch "$ps_unit_pid")
+case "$ps_unit_start" in
+'' | *[!0-9]*)
+	fail "get_process_start_epoch returns a numeric epoch for a live PID (got '$ps_unit_start')"
+	;;
+*)
+	pass "get_process_start_epoch returns a numeric epoch for a live PID"
+	ps_unit_delta=$((ps_unit_now - ps_unit_start))
+	if [ "$ps_unit_delta" -ge -5 ] && [ "$ps_unit_delta" -le 30 ]; then
+		pass "get_process_start_epoch start time is recent (delta ${ps_unit_delta}s)"
+	else
+		fail "get_process_start_epoch start time is recent (delta ${ps_unit_delta}s, expected 0-30s)"
+	fi
+	;;
+esac
+kill "$ps_unit_pid" 2>/dev/null || true
+wait "$ps_unit_pid" 2>/dev/null || true
+
+# A dead or empty PID degrades to an empty string (matching then falls back to
+# most-recent), never an error.
+assert_eq "get_process_start_epoch is empty for a nonexistent PID" \
+	"" "$(get_process_start_epoch 999999)"
+assert_eq "get_process_start_epoch is empty for an empty PID" \
+	"" "$(get_process_start_epoch "")"
+
+# The macOS/BSD path converts `ps -o etime=` elapsed time to seconds via
+# _etime_to_seconds. Pure arithmetic with no date binary / locale / timezone, so
+# these run on every platform. Cover the day-component cases the issue calls out:
+# mm:ss, hh:mm:ss, and the "dd-hh:mm:ss" form with a leading day count.
+assert_eq "_etime_to_seconds parses mm:ss" \
+	"323" "$(_etime_to_seconds "05:23")"
+assert_eq "_etime_to_seconds parses hh:mm:ss (no day component)" \
+	"3923" "$(_etime_to_seconds "01:05:23")"
+assert_eq "_etime_to_seconds parses dd-hh:mm:ss (with day component)" \
+	"176723" "$(_etime_to_seconds "2-01:05:23")"
+assert_eq "_etime_to_seconds treats zero-padded fields as base-10 (not octal)" \
+	"489" "$(_etime_to_seconds "00:08:09")"
+assert_eq "_etime_to_seconds is empty for an unparseable value" \
+	"" "$(_etime_to_seconds "not-a-duration")"
+assert_eq "_etime_to_seconds is empty for a malformed field" \
+	"" "$(_etime_to_seconds "01::23")"
 
 # --- Test 5c4b: Codex rollout session files (e2e) ---
 #

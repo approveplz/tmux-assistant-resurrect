@@ -199,15 +199,15 @@ get_codex_session() {
 	# We glob for state_*.sqlite inside python3 (avoids `ls -t` pipe and
 	# handles spaces in paths cleanly) and pick the newest by mtime.
 	if [ -n "$cwd" ] && command -v python3 >/dev/null 2>&1; then
-		local etimes
-		etimes=$(ps -o etimes= -p "$child_pid" 2>/dev/null | tr -d ' ' || true)
+		local process_start
+		process_start=$(get_process_start_epoch "$child_pid")
 		sid=$(
-			USED_CODEX_SESSION_IDS="$USED_CODEX_SESSION_IDS" python3 - "$HOME/.codex" "$cwd" "$etimes" <<'PY'
-import glob, os, sqlite3, sys, time
+			USED_CODEX_SESSION_IDS="$USED_CODEX_SESSION_IDS" python3 - "$HOME/.codex" "$cwd" "$process_start" <<'PY'
+import glob, os, sqlite3, sys
 
 codex_home = sys.argv[1]
 cwd = sys.argv[2]
-etimes_raw = sys.argv[3].strip()
+start_raw = sys.argv[3].strip()
 used = {sid for sid in os.environ.get("USED_CODEX_SESSION_IDS", "").split("\t") if sid}
 
 # Find the newest state_*.sqlite by mtime.
@@ -216,9 +216,12 @@ dbs = sorted(glob.glob(os.path.join(codex_home, "state_*.sqlite")),
 if not dbs:
     sys.exit(0)
 
-process_start = None
-if etimes_raw.isdigit():
-    process_start = time.time() - int(etimes_raw)
+# Absolute epoch of the assistant process start (empty on platforms where it
+# can't be determined, in which case matching falls back to most-recent).
+try:
+    process_start = float(start_raw) if start_raw else None
+except ValueError:
+    process_start = None
 
 # Open read-only so we never conflict with a running codex writer.
 try:
@@ -275,20 +278,21 @@ PY
 	# - preferring recently modified rollout files
 	local sessions_root="${HOME}/.codex/sessions"
 	if [ -n "$cwd" ] && [ -d "$sessions_root" ] && command -v python3 >/dev/null 2>&1; then
-		local etimes
-		etimes=$(ps -o etimes= -p "$child_pid" 2>/dev/null | tr -d ' ' || true)
+		local process_start
+		process_start=$(get_process_start_epoch "$child_pid")
 		sid=$(
-			USED_CODEX_SESSION_IDS="$USED_CODEX_SESSION_IDS" python3 - "$sessions_root" "$cwd" "$etimes" <<'PY'
-import datetime, json, os, sys, time
+			USED_CODEX_SESSION_IDS="$USED_CODEX_SESSION_IDS" python3 - "$sessions_root" "$cwd" "$process_start" <<'PY'
+import datetime, json, os, sys
 
 sessions_root = sys.argv[1]
 cwd = sys.argv[2]
-etimes_raw = sys.argv[3].strip()
+start_raw = sys.argv[3].strip()
 used = {sid for sid in os.environ.get("USED_CODEX_SESSION_IDS", "").split("\t") if sid}
 
-process_start = None
-if etimes_raw.isdigit():
-    process_start = time.time() - int(etimes_raw)
+try:
+    process_start = float(start_raw) if start_raw else None
+except ValueError:
+    process_start = None
 
 def parse_ts(value):
     if not value:
@@ -454,13 +458,13 @@ select_jsonl_session_id() {
 	[ "$#" -gt 0 ] || return 0
 	command -v python3 >/dev/null 2>&1 || return 0
 
-	local etimes
-	etimes=$(ps -o etimes= -p "$child_pid" 2>/dev/null | tr -d ' ' || true)
-	python3 - "$cwd" "$etimes" "$used_ids" "$@" <<'PY'
-import datetime, glob, json, os, sys, time
+	local process_start
+	process_start=$(get_process_start_epoch "$child_pid")
+	python3 - "$cwd" "$process_start" "$used_ids" "$@" <<'PY'
+import datetime, glob, json, os, sys
 
 cwd = sys.argv[1]
-etimes_raw = sys.argv[2].strip()
+start_raw = sys.argv[2].strip()
 used = {sid for sid in sys.argv[3].split("\t") if sid}
 session_dirs = []
 seen_dirs = set()
@@ -473,9 +477,10 @@ for session_dir in sys.argv[4:]:
     seen_dirs.add(key)
     session_dirs.append(session_dir)
 
-process_start = None
-if etimes_raw.isdigit():
-    process_start = time.time() - int(etimes_raw)
+try:
+    process_start = float(start_raw) if start_raw else None
+except ValueError:
+    process_start = None
 
 def parse_ts(value):
     if not value:
@@ -820,6 +825,110 @@ register_omp_session_id() {
 		USED_OMP_SESSION_IDS="${USED_OMP_SESSION_IDS}"$'\t'"$sid"
 		;;
 	esac
+}
+
+# Wall-clock start time of a process, as a Unix epoch (seconds). Prints nothing
+# when it can't be determined. Session matching uses this to tell the live
+# assistant session apart from stale sessions sharing the same cwd; without it,
+# matching degrades to "newest session in this cwd" and can restore the wrong one.
+#
+# Linux reads /proc/PID/stat directly with the shell's `read` builtin — no
+# fork/exec, matching read_process_env() and ~30x cheaper than spawning ps.
+# macOS/BSD have no /proc, so fall back to elapsed time (`ps -o etime=`) there.
+# (The old `ps -o etimes=` used everywhere was a GNU keyword BSD ps rejects, so
+# it silently produced nothing on macOS — see issue #49.)
+get_process_start_epoch() {
+	local pid="$1"
+	[ -n "$pid" ] || return 0
+
+	local stat_file="/proc/${pid}/stat"
+	if [ -r "$stat_file" ]; then
+		local stat_line
+		IFS= read -r stat_line <"$stat_file" 2>/dev/null || return 0
+		# comm (field 2) is parenthesized and may contain spaces or ')', so
+		# slice past the final ')'. What remains starts at state (field 3);
+		# starttime (field 22, clock ticks since boot) is then index 19.
+		local rest="${stat_line##*)}"
+		local -a fields
+		# shellcheck disable=SC2206  # deliberate word-split on numeric fields
+		fields=($rest)
+		local starttime="${fields[19]}"
+		case "$starttime" in
+		'' | *[!0-9]*) return 0 ;;
+		esac
+
+		# Boot time (epoch) from /proc/stat; clock ticks/sec from getconf.
+		local btime="" line
+		while IFS= read -r line; do
+			case "$line" in
+			'btime '*)
+				btime="${line#btime }"
+				break
+				;;
+			esac
+		done </proc/stat
+		case "$btime" in
+		'' | *[!0-9]*) return 0 ;;
+		esac
+
+		local hz
+		hz=$(getconf CLK_TCK 2>/dev/null)
+		case "$hz" in
+		'' | *[!0-9]*) hz=100 ;;
+		esac
+
+		echo "$((btime + starttime / hz))"
+		return 0
+	fi
+
+	# Non-Linux (macOS/BSD): no /proc. Derive the start from *elapsed* time
+	# (`ps -o etime=`) rather than an absolute wall-clock timestamp. Elapsed time
+	# is a plain duration, so — unlike parsing `ps -o lstart=` — it carries no
+	# timezone, DST-repeated-hour, or locale ambiguity. Absolute /bin paths so a
+	# PATH with Homebrew coreutils ahead of /bin can't shadow the system ps/date
+	# with GNU builds (see issue #49 review).
+	local etime seconds
+	etime=$(/bin/ps -o etime= -p "$pid" 2>/dev/null | tr -d ' ') || return 0
+	seconds=$(_etime_to_seconds "$etime")
+	[ -n "$seconds" ] || return 0
+	echo "$(($(/bin/date +%s) - seconds))"
+}
+
+# Convert a BSD `ps -o etime=` elapsed time ("[[dd-]hh:]mm:ss") to whole seconds,
+# or print nothing if it doesn't match. Pure arithmetic — no date binary, locale,
+# or timezone involved. Split out so the day-component cases (with and without the
+# leading "dd-") are unit testable without a live process (see issue #49).
+_etime_to_seconds() {
+	local etime="$1" days=0 rest
+	[ -n "$etime" ] || return 0
+	# Optional leading "dd-" day count.
+	case "$etime" in
+	*-*)
+		days=${etime%%-*}
+		rest=${etime#*-}
+		;;
+	*)
+		rest=$etime
+		;;
+	esac
+	# rest is [hh:]mm:ss — split on ':'.
+	local -a parts
+	IFS=: read -r -a parts <<<"$rest"
+	local hours mins secs
+	case "${#parts[@]}" in
+	3) hours=${parts[0]} mins=${parts[1]} secs=${parts[2]} ;;
+	2) hours=0 mins=${parts[0]} secs=${parts[1]} ;;
+	*) return 0 ;;
+	esac
+	# Every component must be a non-empty run of digits.
+	local part
+	for part in "$days" "$hours" "$mins" "$secs"; do
+		case "$part" in
+		'' | *[!0-9]*) return 0 ;;
+		esac
+	done
+	# 10# forces base-10 so zero-padded fields (e.g. "08") aren't read as octal.
+	echo "$((10#$days * 86400 + 10#$hours * 3600 + 10#$mins * 60 + 10#$secs))"
 }
 
 # Read user-configured variables directly from a detected assistant process.
