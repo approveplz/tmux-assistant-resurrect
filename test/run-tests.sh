@@ -1663,14 +1663,14 @@ fi
 #
 # get_process_start_epoch() backs Codex/Pi/OMP session matching: it distinguishes
 # the live assistant session from stale sessions sharing a cwd. It reads
-# /proc/PID/stat on Linux and parses `ps -o lstart=` on macOS/BSD (issue #49 —
-# the old `ps -o etimes=` was a GNU keyword BSD ps silently rejected).
+# /proc/PID/stat on Linux and elapsed time (`ps -o etime=`) on macOS/BSD (issue
+# #49 — the old `ps -o etimes=` was a GNU keyword BSD ps silently rejected).
 echo ""
 echo "=== Test 5c4d: process start-time helper unit tests ==="
 echo ""
 
 # Cross-platform: a freshly spawned process should report a start epoch that is
-# numeric and within a few seconds of now (covers /proc on Linux, lstart on mac).
+# numeric and within a few seconds of now (covers /proc on Linux, etime on mac).
 sleep 30 &
 ps_unit_pid=$!
 ps_unit_now=$(date +%s)
@@ -1699,42 +1699,22 @@ assert_eq "get_process_start_epoch is empty for a nonexistent PID" \
 assert_eq "get_process_start_epoch is empty for an empty PID" \
 	"" "$(get_process_start_epoch "")"
 
-# macOS/BSD: _lstart_to_epoch must parse `ps -o lstart=` output including the
-# space-padded single-digit day the issue calls out. Two timestamps one month
-# apart at the same time of day must land exactly 25 days (2160000s) apart —
-# a timezone-independent check that both the two-digit and space-padded forms
-# parse, and parse correctly. BSD `date -j` only exists on macOS/BSD, and the
-# helper calls it by absolute path (/bin/date) so a coreutils PATH can't shadow it.
-if /bin/date -j -f "%a %b %d %T %Y" "Wed Jul 30 12:00:00 2025" "+%s" >/dev/null 2>&1; then
-	lstart_day30=$(_lstart_to_epoch "Wed Jul 30 12:00:00 2025")
-	lstart_day5=$(_lstart_to_epoch "Sat Jul  5 12:00:00 2025")
-	assert_eq "_lstart_to_epoch parses a two-digit day component" \
-		"1" "$(case "$lstart_day30" in '' | *[!0-9]*) echo 0 ;; *) echo 1 ;; esac)"
-	assert_eq "_lstart_to_epoch parses a space-padded single-digit day component" \
-		"1" "$(case "$lstart_day5" in '' | *[!0-9]*) echo 0 ;; *) echo 1 ;; esac)"
-	assert_eq "_lstart_to_epoch computes both day forms consistently (25 days apart)" \
-		"2160000" "$((lstart_day30 - lstart_day5))"
-	assert_eq "_lstart_to_epoch is empty for an unparseable timestamp" \
-		"" "$(_lstart_to_epoch "not a date")"
-
-	# Regression: under a localized environment `ps -o lstart=` prints localized
-	# month/day names (fr_FR: "jeu. 30 juil. ..."), which the English parse format
-	# rejects. get_process_start_epoch must pin LC_ALL=C so a non-English tmux
-	# doesn't silently disable process-lifetime matching (issue #49 review).
-	if locale -a 2>/dev/null | grep -qiE "^fr_FR\.(UTF-8|utf8)$"; then
-		sleep 30 &
-		locale_pid=$!
-		locale_epoch=$(LC_ALL=fr_FR.UTF-8 get_process_start_epoch "$locale_pid")
-		assert_eq "get_process_start_epoch resolves under a non-English locale" \
-			"1" "$(case "$locale_epoch" in '' | *[!0-9]*) echo 0 ;; *) echo 1 ;; esac)"
-		kill "$locale_pid" 2>/dev/null || true
-		wait "$locale_pid" 2>/dev/null || true
-	else
-		echo "SKIP: fr_FR.UTF-8 locale unavailable — non-English lstart regression check"
-	fi
-else
-	echo "SKIP: BSD 'date -j' unavailable — lstart parsing is macOS/BSD-only"
-fi
+# The macOS/BSD path converts `ps -o etime=` elapsed time to seconds via
+# _etime_to_seconds. Pure arithmetic with no date binary / locale / timezone, so
+# these run on every platform. Cover the day-component cases the issue calls out:
+# mm:ss, hh:mm:ss, and the "dd-hh:mm:ss" form with a leading day count.
+assert_eq "_etime_to_seconds parses mm:ss" \
+	"323" "$(_etime_to_seconds "05:23")"
+assert_eq "_etime_to_seconds parses hh:mm:ss (no day component)" \
+	"3923" "$(_etime_to_seconds "01:05:23")"
+assert_eq "_etime_to_seconds parses dd-hh:mm:ss (with day component)" \
+	"176723" "$(_etime_to_seconds "2-01:05:23")"
+assert_eq "_etime_to_seconds treats zero-padded fields as base-10 (not octal)" \
+	"489" "$(_etime_to_seconds "00:08:09")"
+assert_eq "_etime_to_seconds is empty for an unparseable value" \
+	"" "$(_etime_to_seconds "not-a-duration")"
+assert_eq "_etime_to_seconds is empty for a malformed field" \
+	"" "$(_etime_to_seconds "01::23")"
 
 # --- Test 5c4b: Codex rollout session files (e2e) ---
 #

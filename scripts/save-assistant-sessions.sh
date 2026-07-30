@@ -834,9 +834,9 @@ register_omp_session_id() {
 #
 # Linux reads /proc/PID/stat directly with the shell's `read` builtin — no
 # fork/exec, matching read_process_env() and ~30x cheaper than spawning ps.
-# macOS/BSD have no /proc, so fall back to `ps -o lstart=` there. (The old
-# `ps -o etimes=` used everywhere was a GNU keyword BSD ps rejects, so it
-# silently produced nothing on macOS — see issue #49.)
+# macOS/BSD have no /proc, so fall back to elapsed time (`ps -o etime=`) there.
+# (The old `ps -o etimes=` used everywhere was a GNU keyword BSD ps rejects, so
+# it silently produced nothing on macOS — see issue #49.)
 get_process_start_epoch() {
 	local pid="$1"
 	[ -n "$pid" ] || return 0
@@ -881,36 +881,54 @@ get_process_start_epoch() {
 		return 0
 	fi
 
-	# Non-Linux (macOS/BSD): no /proc. `ps -o lstart=` gives an absolute start
-	# timestamp we convert to epoch. Force LC_ALL=C so month/day names come out
-	# in the fixed English form _lstart_to_epoch parses — under a localized tmux
-	# (e.g. fr_BE prints "jeu. 30 juil. ...") the default output won't match.
-	# Use the absolute /bin path: this branch only runs on macOS/BSD, and a PATH
-	# with Homebrew coreutils ahead of /bin would otherwise resolve GNU ps/date,
-	# which don't speak BSD `lstart`/`-j` (see issue #49 review).
-	local lstart
-	lstart=$(LC_ALL=C /bin/ps -o lstart= -p "$pid" 2>/dev/null) || return 0
-	_lstart_to_epoch "$lstart"
+	# Non-Linux (macOS/BSD): no /proc. Derive the start from *elapsed* time
+	# (`ps -o etime=`) rather than an absolute wall-clock timestamp. Elapsed time
+	# is a plain duration, so — unlike parsing `ps -o lstart=` — it carries no
+	# timezone, DST-repeated-hour, or locale ambiguity. Absolute /bin paths so a
+	# PATH with Homebrew coreutils ahead of /bin can't shadow the system ps/date
+	# with GNU builds (see issue #49 review).
+	local etime seconds
+	etime=$(/bin/ps -o etime= -p "$pid" 2>/dev/null | tr -d ' ') || return 0
+	seconds=$(_etime_to_seconds "$etime")
+	[ -n "$seconds" ] || return 0
+	echo "$(($(/bin/date +%s) - seconds))"
 }
 
-# Convert a BSD `ps -o lstart=` timestamp (e.g. "Thu Jul 30 22:10:10 2026") to a
-# Unix epoch, or print nothing on failure. Collapsing runs of spaces lets both
-# "Jul 30" and the space-padded single-digit "Jul  5" parse with one format.
-# Split out from get_process_start_epoch so the day-component cases are unit
-# testable without a live process (see issue #49).
-_lstart_to_epoch() {
-	local lstart
-	lstart=$(printf '%s' "$1" | tr -s ' ' | sed -e 's/^ //' -e 's/ $//')
-	[ -n "$lstart" ] || return 0
-	# LC_ALL=C so the English %a/%b names in the format match the input, whatever
-	# locale the caller runs under. Absolute /bin/date because BSD `-j` only exists
-	# there — a Homebrew-coreutils PATH would otherwise shadow it with GNU date.
-	local epoch
-	epoch=$(LC_ALL=C /bin/date -j -f "%a %b %d %T %Y" "$lstart" "+%s" 2>/dev/null) || return 0
-	case "$epoch" in
-	'' | *[!0-9]*) return 0 ;;
+# Convert a BSD `ps -o etime=` elapsed time ("[[dd-]hh:]mm:ss") to whole seconds,
+# or print nothing if it doesn't match. Pure arithmetic — no date binary, locale,
+# or timezone involved. Split out so the day-component cases (with and without the
+# leading "dd-") are unit testable without a live process (see issue #49).
+_etime_to_seconds() {
+	local etime="$1" days=0 rest
+	[ -n "$etime" ] || return 0
+	# Optional leading "dd-" day count.
+	case "$etime" in
+	*-*)
+		days=${etime%%-*}
+		rest=${etime#*-}
+		;;
+	*)
+		rest=$etime
+		;;
 	esac
-	echo "$epoch"
+	# rest is [hh:]mm:ss — split on ':'.
+	local -a parts
+	IFS=: read -r -a parts <<<"$rest"
+	local hours mins secs
+	case "${#parts[@]}" in
+	3) hours=${parts[0]} mins=${parts[1]} secs=${parts[2]} ;;
+	2) hours=0 mins=${parts[0]} secs=${parts[1]} ;;
+	*) return 0 ;;
+	esac
+	# Every component must be a non-empty run of digits.
+	local part
+	for part in "$days" "$hours" "$mins" "$secs"; do
+		case "$part" in
+		'' | *[!0-9]*) return 0 ;;
+		esac
+	done
+	# 10# forces base-10 so zero-padded fields (e.g. "08") aren't read as octal.
+	echo "$((10#$days * 86400 + 10#$hours * 3600 + 10#$mins * 60 + 10#$secs))"
 }
 
 # Read user-configured variables directly from a detected assistant process.
