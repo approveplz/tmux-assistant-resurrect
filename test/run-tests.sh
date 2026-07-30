@@ -3723,6 +3723,187 @@ assert_contains "Bracket model: uses command claude" "$bracket_log" "command cla
 
 kill_pane_children test-restore-bracket true
 
+# --- Regression guard: no pre-fork heredoc/here-string pipes (issue #48) ---
+# The save hook must never feed a program to python3/jq through a shell heredoc
+# or here-string: on bash >= 5.1 those are written to a pipe before the reader
+# is exec'd, and on macOS under pipe-KVA pressure that write can block forever,
+# hanging the hook (GitHub issue #48). Programs are delivered via argv from
+# scripts/py/ instead. These tests fail if the dangerous constructs reappear.
+suite "no_heredoc_pipes"
+echo ""
+echo "=== Test 11: save hook has no heredoc/here-string pipes (issue #48) ==="
+echo ""
+
+SAVE_SCRIPT="$REPO_DIR/scripts/save-assistant-sessions.sh"
+
+# python3 heredoc stdin (`python3 - <<'PY'`), inline `python3 -c`, and `<<<`
+# here-strings. Only comment-only lines may mention them (this file and the
+# hook document the fix in prose).
+risky_constructs=$(grep -nE "<<'?PY'?|python3 -c|python3 - |<<<" "$SAVE_SCRIPT" | grep -vE '^[0-9]+:[[:space:]]*#' || true)
+if [ -z "$risky_constructs" ]; then
+	pass "save hook contains no heredoc/here-string pipe constructs"
+else
+	fail "save hook reintroduced heredoc/here-string pipes: $risky_constructs"
+fi
+
+# Every helper program referenced via $PY_DIR must exist and be valid Python.
+py_missing=""
+py_bad=""
+while IFS= read -r pyname; do
+	[ -n "$pyname" ] || continue
+	pypath="$REPO_DIR/scripts/py/$pyname"
+	if [ ! -f "$pypath" ]; then
+		py_missing="$py_missing $pyname"
+	elif ! python3 -c "import py_compile,sys; py_compile.compile(sys.argv[1], doraise=True)" "$pypath" 2>/dev/null; then
+		py_bad="$py_bad $pyname"
+	fi
+done < <(grep -oE '\$PY_DIR/[A-Za-z0-9_]+\.py' "$SAVE_SCRIPT" | sed 's#.*/##' | sort -u)
+if [ -z "$py_missing" ]; then
+	pass "all \$PY_DIR helper programs exist"
+else
+	fail "missing helper programs:$py_missing"
+fi
+if [ -z "$py_bad" ]; then
+	pass "all \$PY_DIR helper programs compile"
+else
+	fail "helper programs fail to compile:$py_bad"
+fi
+
+# --- Watchdog: bounded completion + stuck-worker reaping ---
+suite "save_watchdog"
+echo ""
+echo "=== Test 12: watchdog bounds runtime and reaps stuck workers ==="
+echo ""
+
+WD_HELPER="$(mktemp)"
+# Runs in its own process so reaping its descendants can't touch the harness.
+cat >"$WD_HELPER" <<WDEOF
+#!/usr/bin/env bash
+set -euo pipefail
+dir="\$1"; mode="\${2:-normal}"
+export TMUX_ASSISTANT_RESURRECT_DIR="\$dir/state"
+export TMUX_RESURRECT_DIR="\$dir/resurrect"
+mkdir -p "\$dir/state" "\$dir/resurrect"
+tmux() { return 0; }
+source "$SAVE_SCRIPT"
+LOG_FILE="\$dir/wd.log"; : >"\$LOG_FILE"
+
+# descendant_pids enumerates a live child; reap_descendants terminates it.
+sleep 30 & child=\$!
+descendant_pids "\$\$" | grep -qx "\$child" && echo "DESC_OK" || echo "DESC_FAIL"
+reap_descendants "\$\$" "" TERM
+sleep 0.5
+kill -0 "\$child" 2>/dev/null && { echo "REAP_FAIL"; kill "\$child" 2>/dev/null; } || echo "REAP_OK"
+
+SAVE_TIMEOUT=2
+selffile=\$(mktemp)
+WATCHDOG_FIRED_FILE=\$(mktemp)
+save_watchdog "\$\$" "\$selffile" "\$WATCHDOG_FIRED_FILE" >/dev/null &
+WATCHDOG_PID=\$!
+echo "\$WATCHDOG_PID" >"\$selffile"
+disown "\$WATCHDOG_PID" 2>/dev/null || true
+# Mirror main()'s cleanup trap EXACTLY, including the file-removal ordering, so
+# this exercises the real stop-then-rm path (a trap that rm'd the fired file
+# before stop_save_watchdog would silently defeat the fired-check).
+trap 'stop_save_watchdog; rm -f "\$selffile" "\$WATCHDOG_FIRED_FILE"' EXIT
+start=\$SECONDS
+case "\$mode" in
+hard)
+	# Worker ignores SIGTERM, forcing the SIGKILL + kill-main hard-deadline path.
+	x=\$(bash -c 'trap "" TERM; while :; do sleep 1; done') || true
+	;;
+grandchild)
+	# The worker's parent dies on SIGTERM (unblocking main), leaving a
+	# TERM-ignoring grandchild that gets reparented away from main's tree. The
+	# fired watchdog must still SIGKILL it even though main recovers and exits.
+	x=\$(
+		bash -c 'trap "" TERM; while :; do sleep 1; done' >/dev/null 2>&1 &
+		echo "\$!" >"\$dir/grandchild.pid"
+		sleep 30
+	) || true
+	;;
+*)
+	x=\$(sleep 30) || true
+	;;
+esac
+echo "ELAPSED=\$((SECONDS - start))"
+# stop_save_watchdog runs from the EXIT trap above (real trap ordering).
+WDEOF
+
+# Normal mode: the watchdog TERMs the wedged worker so main unblocks in time.
+WD_DIR="$(mktemp -d)"
+wd_out=$(bash "$WD_HELPER" "$WD_DIR" normal 2>/dev/null || true)
+assert_contains "descendant_pids enumerates a live child" "$wd_out" "DESC_OK"
+assert_contains "reap_descendants terminates a descendant" "$wd_out" "REAP_OK"
+wd_elapsed=$(echo "$wd_out" | sed -n 's/^ELAPSED=//p')
+if [ -n "$wd_elapsed" ] && [ "$wd_elapsed" -le 5 ]; then
+	pass "watchdog unblocks a wedged save within the deadline (${wd_elapsed}s)"
+else
+	fail "watchdog did not bound runtime (elapsed='${wd_elapsed}', output='$wd_out')"
+fi
+rm -rf "$WD_DIR"
+
+# Hard mode: a hook that ignores SIGTERM must still be force-terminated (true
+# total-runtime deadline) and the event logged. Bounded wait so a broken
+# watchdog fails the test instead of hanging the suite.
+HARD_DIR="$(mktemp -d)"
+bash "$WD_HELPER" "$HARD_DIR" hard >/dev/null 2>"$HARD_DIR/err" &
+hard_pid=$!
+hard_bounded=0
+for _i in $(seq 1 20); do
+	kill -0 "$hard_pid" 2>/dev/null || { hard_bounded=1; break; }
+	sleep 0.5
+done
+if [ "$hard_bounded" -eq 1 ]; then
+	pass "watchdog enforces a hard deadline on a TERM-ignoring hook"
+else
+	fail "watchdog failed to terminate a TERM-ignoring hook within ~10s"
+	kill -9 "$hard_pid" 2>/dev/null || true
+fi
+wait "$hard_pid" 2>/dev/null || true
+sleep 1  # let the orphaned watchdog flush its post-kill report
+# The watchdog reports to stderr only (never to LOG_FILE, which could block on a
+# stalled filesystem and accumulate stuck watchdogs).
+assert_contains "watchdog reports the hard timeout on stderr" "$(cat "$HARD_DIR/err" 2>/dev/null)" "terminated stuck save"
+rm -rf "$HARD_DIR"
+
+# Grandchild leak: a TERM-ignoring grandchild reparented off a worker that main
+# was blocked on must still be SIGKILLed, even though killing the worker lets
+# main recover and exit (cancelling nothing — the watchdog is already "fired").
+GC_DIR="$(mktemp -d)"
+bash "$WD_HELPER" "$GC_DIR" grandchild >/dev/null 2>&1  # returns when main exits (~2s)
+sleep 4  # let the fired watchdog finish its grace + SIGKILL escalation
+gc_pid=$(cat "$GC_DIR/grandchild.pid" 2>/dev/null || true)
+if [ -n "$gc_pid" ] && kill -0 "$gc_pid" 2>/dev/null; then
+	fail "watchdog stranded a reparented TERM-ignoring grandchild (pid $gc_pid)"
+	kill -9 "$gc_pid" 2>/dev/null || true
+else
+	pass "watchdog kills a reparented TERM-ignoring grandchild after main recovers"
+fi
+rm -rf "$GC_DIR"
+
+# Atomic output: a failing serializer must not destroy the previous sidecar.
+ATOMIC_DIR="$(mktemp -d)"
+atomic_out=$(bash -c '
+	set -euo pipefail
+	export TMUX_ASSISTANT_RESURRECT_DIR="'"$ATOMIC_DIR"'/state"
+	export TMUX_RESURRECT_DIR="'"$ATOMIC_DIR"'/resurrect"
+	mkdir -p "$TMUX_ASSISTANT_RESURRECT_DIR" "$TMUX_RESURRECT_DIR"
+	tmux() { return 0; }
+	source "'"$SAVE_SCRIPT"'"
+	printf "%s" "{\"sentinel\":\"KEEP\"}" >"$OUTPUT_FILE"
+	jq() { return 1; }
+	SAVE_TIMEOUT=0
+	if main >/dev/null 2>&1; then echo "MAIN_OK"; else echo "MAIN_FAIL"; fi
+	cat "$OUTPUT_FILE"
+' 2>/dev/null || true)
+assert_contains "failing serializer preserves the previous sidecar" "$atomic_out" "KEEP"
+# The empty-sessions branch must surface a serializer failure, not report success.
+assert_contains "failing serializer is reported, not masked as success" "$atomic_out" "MAIN_FAIL"
+rm -rf "$ATOMIC_DIR"
+
+rm -f "$WD_HELPER"
+
 # --- Summary ---
 
 echo ""

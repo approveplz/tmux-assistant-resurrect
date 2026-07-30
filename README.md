@@ -148,6 +148,8 @@ scripts/
   lib-detect.sh                   # Shared library (detect_tool, pane_has_assistant, posix_quote)
   save-assistant-sessions.sh      # Resurrect post-save hook (process detection + session IDs)
   restore-assistant-sessions.sh   # Resurrect post-restore hook (resumes assistants)
+  py/                             # Helper programs invoked by the save hook via argv
+                                  #   (never via shell heredocs — see issue #48)
 test/
   Dockerfile                      # Docker image with tmux, jq, just, and real assistant CLIs
   bench-save-hook.sh              # Single-scenario save-hook benchmark runner (inside Docker)
@@ -447,6 +449,37 @@ Edit `config/resurrect-assistants.conf`:
 set -g @continuum-save-interval '5'  # minutes
 ```
 
+### Save-hook timeout (watchdog)
+
+Once the save hook reaches its main work — process detection, session-ID
+extraction, and serialization, the phase where the issue #48 hang lived — a
+watchdog bounds how long that phase can run and keeps blocked helper
+subprocesses (`python3` on a locked database, a `stat` on a slow filesystem, a
+hung `jq`) from accumulating. The default deadline is 60 seconds; a normal save
+finishes in a few seconds even with many panes. To change it:
+
+```bash
+set -g @assistant-resurrect-save-timeout '90'   # seconds; 0 disables the watchdog
+```
+
+It can also be set via the `ASSISTANT_RESURRECT_SAVE_TIMEOUT` environment
+variable (the tmux option takes precedence). When the deadline is exceeded the
+watchdog first `SIGTERM`s the stuck worker subprocesses so a merely-wedged save
+can unblock and finish; if the hook is still running shortly after, it escalates
+to `SIGKILL` and terminates the save hook itself. The sidecar
+`assistant-sessions.json` is written atomically (temp file + rename), so a
+terminated or failed save never corrupts the previously saved sessions. A hard
+timeout is reported on the hook's **stderr** (surfaced wherever tmux-resurrect
+captures hook output) rather than to `assistant-save.log` — writing to the log
+could itself block on the same stalled filesystem that triggered the timeout.
+
+> **Scope:** the watchdog is armed at the start of the hook's main work, so it
+> covers detection and serialization (where session-lookup helpers run). A short
+> prologue — reading a couple of tmux options and creating temp files — runs
+> before it is armed; that is the same set of tmux/filesystem calls the hook has
+> always made, and if the tmux server itself is wedged it would not have
+> triggered the save in the first place.
+
 ### Adding support for a new assistant
 
 To add a new AI coding assistant:
@@ -519,6 +552,14 @@ matching binary names. Then extracts session IDs using tool-specific methods
 
 Writes everything to `assistant-sessions.json` in tmux-resurrect's save
 directory (see **Save location** above).
+
+Helper programs (SQLite/JSONL lookups, path resolution) live as standalone
+files under `scripts/py/` and are handed to `python3` via argv. They are
+deliberately **not** embedded as shell heredocs: on bash ≥ 5.1 a heredoc is
+written to a pipe before its reader is exec'd, and on macOS under pipe-memory
+pressure that write can block forever, hanging the hook (issue #48). A watchdog
+(see **Save-hook timeout** above) bounds the detection/serialization phase as a
+second line of defense.
 
 ### Restore hook (`scripts/restore-assistant-sessions.sh`)
 
