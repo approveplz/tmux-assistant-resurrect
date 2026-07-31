@@ -38,8 +38,19 @@ export TMUX_ASSISTANT_RESURRECT_DIR="$BENCH_ROOT/state"
 mkdir -p "$HOME/.tmux/resurrect" "$TMUX_TMPDIR" "$TMUX_ASSISTANT_RESURRECT_DIR" "$BENCH_ROOT/bin"
 
 # Mock claude binary so we can create many assistant processes without network/API keys.
+# Must answer `--help` immediately: the save hook probes `claude --help` to
+# discover session-identity flags (extract_cli_args), so a mock that slept on
+# every invocation would hang that probe — and with the save-hook watchdog armed,
+# get the whole hook SIGKILLed at the deadline. Only the long-lived assistant
+# invocation (`claude --resume ...`) should sleep.
 cat >"$BENCH_ROOT/bin/claude" <<'SH'
 #!/usr/bin/env bash
+case " $* " in
+*" --help "* | *" -h "*)
+	printf '%s\n' 'Usage: claude [options]' '  -r, --resume <id>' '  --model <model>'
+	exit 0
+	;;
+esac
 sleep 600
 SH
 chmod +x "$BENCH_ROOT/bin/claude"
