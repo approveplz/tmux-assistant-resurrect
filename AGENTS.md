@@ -72,7 +72,9 @@ process args as a reliable fallback.
   plus user-configured vars via `@assistant-resurrect-capture-env` tmux option
   (space-separated list, set in tmux.conf)
 - Log files go to `~/.tmux/resurrect/assistant-{save,restore}.log` (truncated to 500 lines per run)
-- Process inspection uses `ps -eo pid=,ppid=` (not `pgrep -P` -- unreliable on macOS)
+- Process inspection uses `ps -eo pid=,ppid=` (not `pgrep -P` -- unreliable on
+  macOS) and resolves descendants from a complete parent map; macOS does not
+  reliably print parents before children.
 - Agent detection matches binary names via `case` patterns in `detect_tool()`
 - Hook matching in jq uses `(.command // "") | contains("claude-session-track")`
   (not exact `==`) to tolerate quoting changes across versions and ensure backward
@@ -114,7 +116,7 @@ These are hard-won lessons. Do not "simplify" them away.
 
 | Gotcha | Details |
 |--------|---------|
-| **macOS `pgrep -P` is unreliable** | Silently misses child processes. Always use `ps -eo pid=,ppid=` with awk |
+| **macOS process enumeration is unordered** | `pgrep -P` can silently miss children, and `ps -eo` can print a child before its parent. Use the shared order-independent `descendant_processes()` helper. |
 | **tmux 3.4 mangles delimiters** | Converts tabs to underscores, control characters to octal escapes in `-F` output. Use `|` (plain pipe) as delimiter |
 | **`printf %q` breaks fish shell** | Not POSIX. Use `posix_quote()` (single-quote wrapping with `'\''` escaping) instead |
 | **`\|\| continue` inside `$()` runs in the subshell** | `continue` executes but only affects the subshell, not the outer loop. Place `\|\| continue` outside the `$()` |

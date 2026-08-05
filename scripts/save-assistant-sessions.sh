@@ -145,7 +145,7 @@ get_codex_session() {
 		sid=$(grep "\"pid\": *${child_pid}[,}]" "$tags_file" 2>/dev/null |
 			tail -1 |
 			jq -r '.session // empty' 2>/dev/null || true)
-		if [ -n "$sid" ]; then
+		if is_codex_session_id "$sid"; then
 			echo "$sid"
 			return
 		fi
@@ -154,8 +154,17 @@ get_codex_session() {
 	# Method 2: resume arg in process args (chicken-and-egg fallback)
 	# After restore, codex is launched as `codex resume <session_id>`.
 	local sid
-	sid=$(echo "$args" | sed -n "s/.*resume  *\([A-Za-z0-9_-]*\).*/\1/p")
-	if [ -n "$sid" ]; then
+	sid=$(printf '%s\n' "$args" | awk '
+		{
+			for (i = 1; i < NF; i++) {
+				if ($i == "resume") {
+					print $(i + 1)
+					exit
+				}
+			}
+		}
+	')
+	if is_codex_session_id "$sid"; then
 		echo "$sid"
 		return
 	fi
@@ -240,11 +249,17 @@ best = max(candidates, key=score)
 print(best[0])
 PY
 )
-		if [ -n "$sid" ]; then
+		if is_codex_session_id "$sid"; then
 			echo "$sid"
 			return
 		fi
 	fi
+}
+
+is_codex_session_id() {
+	local sid="${1:-}"
+	printf '%s\n' "$sid" |
+		grep -Eq '^(ses_[A-Za-z0-9_-]+|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$'
 }
 
 register_codex_session_id() {
@@ -272,6 +287,12 @@ register_codex_session_id() {
 #   codex:    resume <id> (positional subcommand)
 extract_cli_args() {
 	local tool="$1" raw_args="$2"
+	local detected_tool
+	detected_tool=$(detect_tool "$raw_args")
+	if [ "$detected_tool" != "$tool" ]; then
+		echo ""
+		return
+	fi
 
 	# Strip binary name/path: remove first token (which is the binary or /path/to/binary).
 	local args="${raw_args#* }"
@@ -305,8 +326,26 @@ extract_cli_args() {
 		args=$(echo "$args" | sed -E 's/--session[= ] *[^ ]*//; s/-s  *[^ ]*//')
 		;;
 	codex)
-		# resume <id> (positional)
-		args=$(echo "$args" | sed -E 's/resume  *[^ ]*//')
+		# app-server is an internal Codex subprocess, not a reusable TUI
+		# option. Replaying it before `resume` produces
+		# `codex app-server ... resume`, which Codex rejects.
+		case "$args" in
+		app-server | app-server\ *)
+			echo ""
+			return
+			;;
+		esac
+		# Codex sometimes rewrites its displayed process arguments into a
+		# non-CLI order such as `<session-id> resume --internal-flag`. Do not
+		# replay that ambiguous text. Only preserve flags when the displayed
+		# command contains the canonical `resume <valid-session-id>` pair.
+		if printf '%s\n' "$args" | grep -Eq '(^| )resume[[:space:]]+(ses_[A-Za-z0-9_-]+|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})( |$)'; then
+			args=$(printf '%s\n' "$args" |
+				sed -E 's/(^| )resume[[:space:]]+(ses_[A-Za-z0-9_-]+|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})( |$)/ /')
+		elif printf '%s\n' "$args" | grep -Eq '(^| )resume( |$)'; then
+			echo ""
+			return
+		fi
 		;;
 	esac
 
@@ -357,9 +396,7 @@ main() {
 
 				# Walk the entire process tree under the pane shell to find assistants.
 				# This handles wrappers like npx, env, direnv exec, bash -lc, etc.
-				# We collect all descendant PIDs, then check each for an assistant match.
-				# NOTE: single-pass awk assumes ps output is PID-ascending (parents before
-				# children). See lib-detect.sh comment for rationale and limitations.
+				# The shared traversal handles child-before-parent ps output.
 				if [ ! -s "$FOUND_FLAG" ]; then
 					while read -r cpid _ppid cargs; do
 						tool=$(detect_tool "$cargs")
@@ -369,12 +406,7 @@ main() {
 							echo 1 >"$FOUND_FLAG"
 							break
 						fi
-					done < <(
-						echo "$PS_SNAPSHOT" | awk -v root="$shell_pid" '
-							BEGIN { pids[root]=1 }
-							{ if ($2 in pids) { pids[$1]=1; print $1, $2, substr($0, index($0,$3)) } }
-						'
-					)
+					done < <(descendant_processes "$shell_pid" "$PS_SNAPSHOT")
 				fi
 			done
 	done < <(tmux list-panes -a -F "#{session_name}:#{window_index}.#{pane_index}|#{pane_pid}|#{pane_current_path}")

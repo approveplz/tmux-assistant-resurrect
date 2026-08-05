@@ -52,6 +52,7 @@ trap 'rm -f "$tmpfile"' EXIT INT TERM
 echo "$sessions" | jq -c '.[]' >"$tmpfile"
 
 restored=0
+attempted=0
 while read -r entry; do
 	pane=$(echo "$entry" | jq -r '.pane')
 	tool=$(echo "$entry" | jq -r '.tool')
@@ -138,6 +139,12 @@ while read -r entry; do
 		fi
 		;;
 	codex)
+		# Older sidecars may contain arguments copied from Codex's internal
+		# app-server subprocess. They are not TUI options and cannot precede
+		# the top-level `resume` command.
+		case "$cli_args" in
+		app-server | app-server\ *) cli_args="" ;;
+		esac
 		if [ -n "$cli_args" ]; then
 			resume_cmd="command codex ${cli_args} resume ${safe_sid}"
 		else
@@ -156,6 +163,7 @@ while read -r entry; do
 	fi
 
 	log "restoring $tool in $pane (session: $session_id, cmd: $resume_cmd)"
+	attempted=$((attempted + 1))
 
 	# Clear the pane before launching: tmux-resurrect may have restored old
 	# pane contents (captured terminal text from the previous session). Without
@@ -175,12 +183,26 @@ while read -r entry; do
 		tmux send-keys -t "$pane" "${resume_cmd}" Enter
 	fi
 
-	restored=$((restored + 1))
+	# A successful send-keys only proves that tmux accepted keystrokes. Verify
+	# that the requested assistant actually appeared below the pane shell before
+	# reporting success.
+	launch_timeout="${ASSISTANT_RESTORE_LAUNCH_TIMEOUT:-10}"
+	launch_deadline=$((SECONDS + launch_timeout))
+	launched=""
+	while [ "$SECONDS" -lt "$launch_deadline" ]; do
+		launched=$(pane_has_assistant "$pane_shell_pid" || true)
+		[ -z "$launched" ] || break
+		sleep 0.2
+	done
 
-	# Stagger launches to avoid overwhelming the system
-	sleep 1
+	if [ -n "$launched" ]; then
+		restored=$((restored + 1))
+		log "launched $tool in $pane (pid $launched)"
+	else
+		log "failed to launch $tool in $pane within ${launch_timeout}s"
+	fi
 done <"$tmpfile"
 
 rm -f "$tmpfile"
 
-log "restored $restored of $count assistant session(s)"
+log "restored $restored of $count assistant session(s) ($attempted attempted)"

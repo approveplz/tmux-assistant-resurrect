@@ -4,31 +4,98 @@
 #
 # Provides:
 #   detect_tool <args>           — returns tool name or empty string
+#   descendant_processes <pid> [ps_snapshot] — prints every descendant
 #   pane_has_assistant <pane_pid> [ps_snapshot] — returns 0 + prints PID if found
 
 # --- detect_tool ---
-# Match binary name with optional path prefix, standalone or with arguments.
-# Handles: /path/to/claude, claude, claude --resume ..., opencode -s ..., etc.
-# Excludes: opencode run ... (LSP subprocesses)
+# Match the executable token, with an optional interpreter token, rather than
+# any later mention of an assistant path. This distinction matters for recorder
+# wrappers such as:
 #
-# Limitation: patterns match any command line containing /claude, /opencode, or
-# /codex as a path component. An unrelated binary with the same name (e.g., a
-# LaTeX tool named "codex") would be falsely detected. In practice this is rare
-# inside tmux panes, but worth noting. Future: could verify identity via
-# --version or known subcommands if false positives become an issue.
+#   script -q /tmp/capture /opt/homebrew/bin/codex
+#
+# The wrapper is not Codex; the real Codex child is discovered separately by
+# the process-tree walk.
+#
+# Handles: /path/to/claude, claude --resume ..., node /path/to/claude, etc.
+# Excludes: opencode run ... (LSP subprocesses)
 detect_tool() {
 	local args="$1"
-	case "$args" in
-	claude | claude\ * | */claude | */claude\ *) echo "claude" ;;
-	opencode | opencode\ * | */opencode | */opencode\ *)
+	local executable="${args%% *}"
+	local executable_name="${executable##*/}"
+	local remainder=""
+	local tool_args=""
+
+	case "$executable_name" in
+	node | nodejs | bun | bash | sh | zsh)
+		remainder="${args#"$executable"}"
+		remainder="${remainder# }"
+		executable="${remainder%% *}"
+		executable_name="${executable##*/}"
+		tool_args="${remainder#"$executable"}"
+		;;
+	*)
+		tool_args="${args#"$executable"}"
+		;;
+	esac
+	tool_args="${tool_args# }"
+
+	case "$executable_name" in
+	claude) echo "claude" ;;
+	opencode)
 		# Exclude LSP/language server subprocesses
 		case "$args" in
 		*"opencode run "*) ;;
 		*) echo "opencode" ;;
 		esac
 		;;
-	codex | codex\ * | */codex | */codex\ *) echo "codex" ;;
+	codex | codex-*)
+		# app-server is an internal helper spawned by Codex tools, not a
+		# resumable TUI. It may appear before its parent TUI in macOS ps output,
+		# so accepting it here can make the saver assign the wrong rollout.
+		case "$tool_args" in
+		app-server | app-server\ *) ;;
+		*) echo "codex" ;;
+		esac
+		;;
 	esac
+}
+
+# --- descendant_processes ---
+# Print every descendant of a process without relying on ps output order.
+#
+# macOS can return a child before its parent in `ps -eo` output. Build the full
+# parent map first, then repeatedly expand the reachable set. Output preserves
+# snapshot order, but callers do not depend on that order.
+descendant_processes() {
+	local root_pid="$1"
+	local snapshot="${2:-$(ps -eo pid=,ppid=,args= 2>/dev/null)}"
+
+	printf '%s\n' "$snapshot" | awk -v root="$root_pid" '
+		{
+			pid[NR] = $1
+			ppid[NR] = $2
+			args[NR] = substr($0, index($0, $3))
+		}
+		END {
+			reachable[root] = 1
+			do {
+				changed = 0
+				for (i = 1; i <= NR; i++) {
+					if ((ppid[i] in reachable) && !(pid[i] in reachable)) {
+						reachable[pid[i]] = 1
+						changed = 1
+					}
+				}
+			} while (changed)
+
+			for (i = 1; i <= NR; i++) {
+				if ((pid[i] in reachable) && pid[i] != root) {
+					print pid[i], ppid[i], args[i]
+				}
+			}
+		}
+	'
 }
 
 # --- pane_has_assistant ---
@@ -51,24 +118,14 @@ pane_has_assistant() {
 		return 0
 	fi
 
-	# Walk the entire process tree under the pane shell.
-	# Uses a single-pass awk that builds the descendant set as it goes.
-	#
-	# Assumption: ps output is ordered by ascending PID, so parents appear
-	# before children. POSIX doesn't guarantee this, but it holds on Linux
-	# (procfs enumeration) and macOS (libproc). If a child PID appeared before
-	# its parent, it would be missed. A multi-pass approach would be more
-	# robust but slower; in practice, single-pass has been reliable.
 	local found_pid
-	found_pid=$(echo "$snapshot" | awk -v root="$shell_pid" '
-		BEGIN { pids[root]=1 }
-		{ if ($2 in pids) { pids[$1]=1; print $1, substr($0, index($0,$3)) } }
-	' | while read -r cpid cargs; do
-		if [ -n "$(detect_tool "$cargs")" ]; then
-			echo "$cpid"
-			break
-		fi
-	done)
+	found_pid=$(descendant_processes "$shell_pid" "$snapshot" |
+		while read -r cpid _ppid cargs; do
+			if [ -n "$(detect_tool "$cargs")" ]; then
+				echo "$cpid"
+				break
+			fi
+		done)
 
 	if [ -n "$found_pid" ]; then
 		echo "$found_pid"

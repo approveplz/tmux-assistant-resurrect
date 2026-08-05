@@ -945,6 +945,8 @@ STATE_DIR="$TEST_STATE_DIR"
 assert_eq "Codex resume extraction" "ses_codex_789" "$(get_codex_session 99999 "codex resume ses_codex_789")"
 assert_eq "Codex resume with path" "ses_codex_789" "$(get_codex_session 99999 "/usr/bin/codex resume ses_codex_789")"
 assert_eq "Codex bare (no resume)" "" "$(get_codex_session 99999 "codex")"
+assert_eq "Codex rejects option as resume session ID" "" \
+	"$(get_codex_session 99999 "codex 019f87e5-7405-7a90-92f1-f771f415a32f resume --include-non-interactive")"
 
 # --- Codex: rollout session files (Method 3) ---
 # Newer Codex versions write session metadata to ~/.codex/sessions/*/*.jsonl
@@ -1311,6 +1313,16 @@ assert_eq "detect 'codex resume ses_789'" "codex" "$(detect_tool "codex resume s
 assert_eq "detect '/usr/local/bin/claude'" "claude" "$(detect_tool "/usr/local/bin/claude")"
 assert_eq "detect '/opt/homebrew/bin/opencode -s ses_456'" "opencode" "$(detect_tool "/opt/homebrew/bin/opencode -s ses_456")"
 assert_eq "detect '/bin/bash /usr/local/bin/opencode -s ses_456'" "opencode" "$(detect_tool "/bin/bash /usr/local/bin/opencode -s ses_456")"
+assert_eq "ignore script recorder containing codex path" "" \
+	"$(detect_tool "script -q /tmp/codex-session.capture /opt/homebrew/bin/codex")"
+assert_eq "detect codex child behind recorder separately" "codex" \
+	"$(detect_tool "/opt/homebrew/bin/codex resume 019f9002-5e60-71c1-9370-9dce36b415e0")"
+assert_eq "detect native Codex platform binary" "codex" \
+	"$(detect_tool "/opt/homebrew/lib/codex-aarch64-apple-darwin resume 019f9002-5e60-71c1-9370-9dce36b415e0")"
+assert_eq "ignore internal Codex app-server" "" \
+	"$(detect_tool "/Applications/ChatGPT.app/Contents/Resources/codex app-server --listen stdio://")"
+assert_eq "ignore interpreted internal Codex app-server" "" \
+	"$(detect_tool "node /opt/homebrew/bin/codex app-server --listen stdio://")"
 
 # LSP subprocess exclusion
 assert_eq "exclude 'opencode run pyright'" "" "$(detect_tool "opencode run pyright-langserver.js")"
@@ -1387,6 +1399,30 @@ if pane_has_assistant "$guard_empty_pid" >/dev/null 2>&1; then
 else
 	pass "pane_has_assistant correctly ignores non-assistant pane"
 fi
+
+# Test 4: macOS can print a child before its parent. The traversal must still
+# reach the real Codex process while ignoring its recorder wrapper.
+unordered_snapshot=$(cat <<'UNORDERED'
+300 200 /opt/homebrew/bin/codex resume 019f9002-5e60-71c1-9370-9dce36b415e0
+100 1 -zsh
+200 100 script -q /tmp/codex-session.capture /opt/homebrew/bin/codex
+UNORDERED
+)
+assert_eq "pane_has_assistant handles child-before-parent ps output" "300" \
+	"$(pane_has_assistant 100 "$unordered_snapshot")"
+
+# Codex tools can spawn an internal app-server below the real TUI. macOS may
+# list that helper first; detection must skip it and return the resumable TUI.
+internal_first_snapshot=$(cat <<'INTERNAL_FIRST'
+19506 91259 /Applications/ChatGPT.app/Contents/Resources/codex app-server --listen stdio://
+91259 96440 /Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl
+96440 96439 /opt/homebrew/bin/codex resume 019fc879-273d-7353-ae07-0ba21262da23
+96439 71774 script -q /tmp/codex-session.capture /opt/homebrew/bin/codex
+71774 1 -zsh
+INTERNAL_FIRST
+)
+assert_eq "pane_has_assistant skips internal Codex app-server" "96440" \
+	"$(pane_has_assistant 71774 "$internal_first_snapshot")"
 
 # Clean up guard test sessions
 for s in test-guard-direct test-guard-wrapper test-guard-empty; do
@@ -1828,6 +1864,18 @@ assert_eq "Codex strip resume" "--full-auto" \
 assert_eq "Codex bare resume" "" \
 	"$(extract_cli_args "codex" "codex resume ses_abc")"
 
+# Codex: discard rewritten non-CLI process-title order
+assert_eq "Codex discards ambiguous rewritten args" "" \
+	"$(extract_cli_args "codex" "codex 019f87e5-7405-7a90-92f1-f771f415a32f resume --include-non-interactive")"
+
+# Codex: recorder wrappers are not valid sources of Codex CLI flags
+assert_eq "Codex discards recorder wrapper args" "" \
+	"$(extract_cli_args "codex" "script -q /tmp/codex-session.capture /opt/homebrew/bin/codex")"
+
+# Codex: app-server is an internal child, not a reusable TUI option
+assert_eq "Codex discards internal app-server args" "" \
+	"$(extract_cli_args "codex" "codex app-server --listen stdio://")"
+
 # Edge: binary with path prefix
 assert_eq "Binary path prefix stripped" "--dangerously-skip-permissions" \
 	"$(extract_cli_args "claude" "/opt/homebrew/bin/claude --dangerously-skip-permissions")"
@@ -2184,6 +2232,46 @@ fi
 
 tmux set-option -gu @assistant-resurrect-capture-env 2>/dev/null || true
 kill_pane_children test-restore-envfilter true
+
+# --- Test 10f: Restore sanitizes legacy Codex app-server args ---
+
+echo ""
+echo "=== Test 10f: restore sanitizes Codex app-server args ==="
+echo ""
+
+tmux new-session -d -s test-restore-codex-internal -c /tmp 2>/dev/null || true
+sleep 0.5
+
+cat >"$HOME/.tmux/resurrect/assistant-sessions.json" <<'RCODEXINTERNAL'
+{
+  "timestamp": "2026-01-01T00:00:00Z",
+  "sessions": [
+    {
+      "pane": "test-restore-codex-internal:0.0",
+      "tool": "codex",
+      "session_id": "019fa516-18a0-7181-a1db-ed65442ef2f8",
+      "cwd": "/tmp",
+      "pid": "99999",
+      "cli_args": "app-server --listen stdio://",
+      "env": {}
+    }
+  ]
+}
+RCODEXINTERNAL
+
+>"$RESTORE_LOG"
+ASSISTANT_RESTORE_LAUNCH_TIMEOUT=1 just restore 2>&1
+
+codex_internal_log=$(cat "$RESTORE_LOG")
+assert_contains "Codex internal args: uses top-level resume" "$codex_internal_log" \
+	"command codex resume '019fa516-18a0-7181-a1db-ed65442ef2f8'"
+if echo "$codex_internal_log" | grep -q "command codex app-server"; then
+	fail "Codex internal args: replayed app-server"
+else
+	pass "Codex internal args: app-server excluded"
+fi
+
+kill_pane_children test-restore-codex-internal true
 
 # --- Summary ---
 
