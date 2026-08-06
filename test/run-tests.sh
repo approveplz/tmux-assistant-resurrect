@@ -526,6 +526,8 @@ assert_contains "Restore log mentions opencode" "$restore_log_content" "restorin
 assert_contains "Restore log mentions codex" "$restore_log_content" "restoring codex"
 assert_contains "Restore log mentions pi" "$restore_log_content" "restoring pi"
 assert_contains "Restore log mentions omp" "$restore_log_content" "restoring omp"
+assert_contains "Restore verifies assistants actually launched" "$restore_log_content" "launched codex"
+assert_contains "Restore reports attempted launch count" "$restore_log_content" "attempted)"
 
 # Verify the restore log contains the correct resume commands
 # (pane content is unreliable — real CLIs take over the terminal and clear it)
