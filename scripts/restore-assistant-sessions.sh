@@ -64,6 +64,15 @@ while read -r entry; do
 	env_json=$(echo "$entry" | jq -c '.env // {}')
 	copilot_home=$(echo "$entry" | jq -r '.copilot_home // empty')
 
+	# Sidecars written before internal Codex helpers were filtered may contain
+	# app-server arguments. They are not TUI options and must not be replayed
+	# before the top-level `resume` command.
+	if [ "$tool" = "codex" ]; then
+		case "$cli_args" in
+		app-server | app-server\ *) cli_args="" ;;
+		esac
+	fi
+
 	# Check if the target pane's session exists
 	tmux_session="${pane%%:*}"
 	if ! tmux has-session -t "$tmux_session" 2>/dev/null; then
