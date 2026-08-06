@@ -162,6 +162,12 @@ get_opencode_session() {
 	fi
 }
 
+is_codex_session_id() {
+	local sid="${1:-}"
+	printf '%s\n' "$sid" |
+		grep -Eq '^(ses_[A-Za-z0-9_-]+|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$'
+}
+
 get_codex_session() {
 	local child_pid="$1"
 	local args="$2"
@@ -174,7 +180,7 @@ get_codex_session() {
 		sid=$(grep "\"pid\": *${child_pid}[,}]" "$tags_file" 2>/dev/null |
 			tail -1 |
 			jq -r '.session // empty' 2>/dev/null || true)
-		if [ -n "$sid" ]; then
+		if is_codex_session_id "$sid"; then
 			echo "$sid"
 			return
 		fi
@@ -183,8 +189,17 @@ get_codex_session() {
 	# Method 2: resume arg in process args (chicken-and-egg fallback)
 	# After restore, codex is launched as `codex resume <session_id>`.
 	local sid
-	sid=$(echo "$args" | sed -n "s/.*resume  *\([A-Za-z0-9_-]*\).*/\1/p")
-	if [ -n "$sid" ]; then
+	sid=$(printf '%s\n' "$args" | awk '
+		{
+			for (i = 1; i < NF; i++) {
+				if ($i == "resume") {
+					print $(i + 1)
+					exit
+				}
+			}
+		}
+	')
+	if is_codex_session_id "$sid"; then
 		echo "$sid"
 		return
 	fi
@@ -210,7 +225,7 @@ get_codex_session() {
 		sid=$(
 			USED_CODEX_SESSION_IDS="$USED_CODEX_SESSION_IDS" python3 "$PY_DIR/codex_state_db.py" "$HOME/.codex" "$cwd" "$process_start"
 		)
-		if [ -n "$sid" ]; then
+		if is_codex_session_id "$sid"; then
 			echo "$sid"
 			return
 		fi
@@ -234,7 +249,7 @@ get_codex_session() {
 		sid=$(
 			USED_CODEX_SESSION_IDS="$USED_CODEX_SESSION_IDS" python3 "$PY_DIR/codex_rollout.py" "$sessions_root" "$cwd" "$process_start"
 		)
-		if [ -n "$sid" ]; then
+		if is_codex_session_id "$sid"; then
 			echo "$sid"
 			return
 		fi
@@ -980,6 +995,12 @@ _warm_session_discovery() {
 # tool version without manual flag list maintenance.
 extract_cli_args() {
 	local tool="$1" raw_args="$2"
+	local detected_tool
+	detected_tool=$(detect_tool "$raw_args")
+	if [ "$detected_tool" != "$tool" ]; then
+		echo ""
+		return
+	fi
 
 	# Strip binary name/path: remove first token (which is the binary or /path/to/binary).
 	local args="${raw_args#* }"
@@ -999,6 +1020,18 @@ extract_cli_args() {
 		args="${args# }"
 		;;
 	esac
+
+	# Codex can rewrite its displayed process title into the non-CLI order
+	# `<session-id> resume <internal-flags>`. Replaying that text would build an
+	# invalid command, so keep no extra arguments in that case. app-server and
+	# recorder wrappers have already been rejected by detect_tool().
+	if [ "$tool" = "codex" ]; then
+		first_arg="${args%% *}"
+		if is_codex_session_id "$first_arg" && printf '%s\n' "$args" | grep -Eq '(^| )resume( |$)'; then
+			echo ""
+			return
+		fi
+	fi
 
 	# Strip tool-specific session/resume flags.
 	local pattern_var="SESSION_FLAG_PATTERN_${tool}"
@@ -1355,17 +1388,31 @@ main() {
 			# in the BFS loop below filters the resulting empty first element.
 			child_list[ppid] = (ppid in child_list) ? child_list[ppid] SUBSEP pid : "" pid
 
-			# Detect tool in command args
+			# Detect the executable token, optionally after a common script
+			# interpreter. Do not classify recorder wrappers merely because a
+			# later argument names the assistant they will launch.
 			# Keep patterns aligned with detect_tool() in lib-detect.sh:
-			# - bare binary at start, or path component (/tool)
-			# - opencode excludes "opencode run " subprocesses
-			# - omp excludes hidden "__omp_worker_" subprocesses
-			if      (line ~ /(^claude( |$)|\/claude( |$))/)                                      proc_tool[pid] = "claude"
-			else if (line ~ /(^opencode( |$)|\/opencode( |$))/ && line !~ /opencode run /)       proc_tool[pid] = "opencode"
-			else if (line ~ /(^codex( |$)|\/codex( |$))/)                                        proc_tool[pid] = "codex"
-			else if (line ~ /(^pi( |$)|\/pi( |$))/)                                              proc_tool[pid] = "pi"
-			else if (line ~ /(^omp( |$)|\/omp( |$))/ && line !~ /__omp_worker_/)                 proc_tool[pid] = "omp"
-			else if (line ~ /(^grok( |$)|\/grok( |$))/)                                          proc_tool[pid] = "grok"
+			nwords = split(line, words, /[ \t]+/)
+			executable = words[1]
+			sub(/^.*\//, "", executable)
+			arg_start = 2
+			if (executable ~ /^(node|nodejs|bun|bash|sh|zsh)$/ && nwords >= 2) {
+				executable = words[2]
+				sub(/^.*\//, "", executable)
+				arg_start = 3
+			}
+			tool_args = ""
+			for (word_index = arg_start; word_index <= nwords; word_index++) {
+				tool_args = tool_args (tool_args == "" ? "" : " ") words[word_index]
+			}
+
+			if      (executable == "claude")                                                    proc_tool[pid] = "claude"
+			else if (executable == "opencode" && tool_args !~ /^run( |$)/)                     proc_tool[pid] = "opencode"
+			else if ((executable == "codex" || executable ~ /^codex-[^-]+-[^-]+-.+/) &&
+			         tool_args !~ /^app-server( |$)/)                                           proc_tool[pid] = "codex"
+			else if (executable == "pi")                                                        proc_tool[pid] = "pi"
+			else if (executable == "omp" && tool_args !~ /(^| )__omp_worker_/)                 proc_tool[pid] = "omp"
+			else if (executable == "grok")                                                      proc_tool[pid] = "grok"
 		}
 		END {
 			for (i = 1; i <= pane_count; i++) {

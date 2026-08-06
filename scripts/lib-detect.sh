@@ -4,42 +4,109 @@
 #
 # Provides:
 #   detect_tool <args>           — returns tool name or empty string
+#   descendant_processes <pid> [ps_snapshot] — prints every descendant
 #   pane_has_assistant <pane_pid> [ps_snapshot] — returns 0 + prints PID if found
 #   resurrect_data_dir           — prints tmux-resurrect's save directory
 
 # --- detect_tool ---
-# Match binary name with optional path prefix, standalone or with arguments.
+# Match the executable token, with an optional interpreter token, rather than
+# any later mention of an assistant path. Recorder wrappers can include the
+# future executable in their arguments; the actual assistant is discovered as
+# a separate child by the process-tree walk.
+#
 # Handles: /path/to/claude, claude, claude --resume ..., opencode -s ...,
 #          codex resume ..., pi --session ..., omp --resume ..., grok --resume ..., etc.
-# Excludes: opencode run ... (LSP subprocesses), omp __omp_worker_* subprocesses
-#
-# Limitation: patterns match any command line containing /claude, /opencode,
-# /codex, /pi, /omp, or /grok as a path component. An unrelated binary with the same name
-# (e.g., a LaTeX tool named "codex") would be falsely detected. In practice this is rare
-# inside tmux panes, but worth noting. Future: could verify identity via
-# --version or known subcommands if false positives become an issue.
+# Excludes: Codex app-server, opencode run (LSP), and OMP worker subprocesses.
 detect_tool() {
 	local args="$1"
-	case "$args" in
-	claude | claude\ * | */claude | */claude\ *) echo "claude" ;;
-	opencode | opencode\ * | */opencode | */opencode\ *)
+	local executable="${args%% *}"
+	local executable_name="${executable##*/}"
+	local remainder=""
+	local tool_args=""
+
+	case "$executable_name" in
+	node | nodejs | bun | bash | sh | zsh)
+		remainder="${args#"$executable"}"
+		remainder="${remainder# }"
+		executable="${remainder%% *}"
+		executable_name="${executable##*/}"
+		tool_args="${remainder#"$executable"}"
+		;;
+	*)
+		tool_args="${args#"$executable"}"
+		;;
+	esac
+	tool_args="${tool_args# }"
+
+	case "$executable_name" in
+	claude) echo "claude" ;;
+	opencode)
 		# Exclude LSP/language server subprocesses
-		case "$args" in
-		*"opencode run "*) ;;
+		case "$tool_args" in
+		run | run\ *) ;;
 		*) echo "opencode" ;;
 		esac
 		;;
-	codex | codex\ * | */codex | */codex\ *) echo "codex" ;;
-	pi | pi\ * | */pi | */pi\ *) echo "pi" ;;
-	omp | omp\ * | */omp | */omp\ *)
+	codex | codex-*-*-*)
+		# app-server is an internal helper, not a resumable TUI.
+		case "$tool_args" in
+		app-server | app-server\ *) ;;
+		*) echo "codex" ;;
+		esac
+		;;
+	pi) echo "pi" ;;
+	omp)
 		# Exclude hidden OMP worker subprocesses; their process title can also be "omp".
-		case "$args" in
-		*"__omp_worker_"*) ;;
+		case "$tool_args" in
+		__omp_worker_* | *" __omp_worker_"*) ;;
 		*) echo "omp" ;;
 		esac
 		;;
-	grok | grok\ * | */grok | */grok\ *) echo "grok" ;;
+	grok) echo "grok" ;;
 	esac
+}
+
+# --- descendant_processes ---
+# Print descendants in breadth-first order without relying on ps output order.
+# Building the full parent map first matters on macOS, where a child can appear
+# before its parent in `ps -eo` output.
+descendant_processes() {
+	local root_pid="$1"
+	local snapshot="${2:-$(ps -eo pid=,ppid=,args= 2>/dev/null)}"
+
+	printf '%s\n' "$snapshot" | awk -v root="$root_pid" '
+		{
+			pid = $1 + 0
+			ppid = $2 + 0
+			line = $0
+			sub(/^[ \t]*[0-9]+[ \t]+[0-9]+[ \t]*/, "", line)
+			parent[pid] = ppid
+			args[pid] = line
+			children[ppid] = (ppid in children) ? children[ppid] SUBSEP pid : "" pid
+		}
+		END {
+			qs = 1
+			qe = 0
+			if (root in children) {
+				n = split(children[root], child, SUBSEP)
+				for (i = 1; i <= n; i++) {
+					candidate = child[i] + 0
+					if (candidate > 0) queue[++qe] = candidate
+				}
+			}
+			while (qs <= qe) {
+				current = queue[qs++] + 0
+				print current, parent[current], args[current]
+				if (current in children) {
+					n = split(children[current], child, SUBSEP)
+					for (i = 1; i <= n; i++) {
+						candidate = child[i] + 0
+						if (candidate > 0) queue[++qe] = candidate
+					}
+				}
+			}
+		}
+	'
 }
 
 # --- pane_has_assistant ---
@@ -62,24 +129,14 @@ pane_has_assistant() {
 		return 0
 	fi
 
-	# Walk the entire process tree under the pane shell.
-	# Uses a single-pass awk that builds the descendant set as it goes.
-	#
-	# Assumption: ps output is ordered by ascending PID, so parents appear
-	# before children. POSIX doesn't guarantee this, but it holds on Linux
-	# (procfs enumeration) and macOS (libproc). If a child PID appeared before
-	# its parent, it would be missed. A multi-pass approach would be more
-	# robust but slower; in practice, single-pass has been reliable.
 	local found_pid
-	found_pid=$(echo "$snapshot" | awk -v root="$shell_pid" '
-		BEGIN { pids[root]=1 }
-		{ if ($2 in pids) { pids[$1]=1; print $1, substr($0, index($0,$3)) } }
-	' | while read -r cpid cargs; do
-		if [ -n "$(detect_tool "$cargs")" ]; then
-			echo "$cpid"
-			break
-		fi
-	done)
+	found_pid=$(descendant_processes "$shell_pid" "$snapshot" |
+		while read -r cpid _ppid cargs; do
+			if [ -n "$(detect_tool "$cargs")" ]; then
+				echo "$cpid"
+				break
+			fi
+		done)
 
 	if [ -n "$found_pid" ]; then
 		echo "$found_pid"

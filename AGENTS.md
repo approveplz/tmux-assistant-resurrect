@@ -84,8 +84,12 @@ process args as a reliable fallback.
   instead.
 - Log files go to `assistant-{save,restore}.log` in tmux-resurrect's save dir
   (resolved by `resurrect_data_dir` in `lib-detect.sh`; truncated to 500 lines per run)
-- Process inspection uses `ps -eo pid=,ppid=` (not `pgrep -P` -- unreliable on macOS)
-- Agent detection matches binary names via `case` patterns in `detect_tool()`
+- Process inspection uses `ps -eo pid=,ppid=` (not `pgrep -P` -- unreliable on
+  macOS) and builds a complete parent map before traversing descendants; `ps`
+  does not guarantee that parents appear before children
+- Agent detection matches the executable token rather than later argument text.
+  Keep `detect_tool()` and the batched awk detector in the save path aligned;
+  internal helpers such as Codex `app-server` are not resumable assistants
 - Hook install uses two-phase matching: **exact equality** (`== $cmd`) to detect
   whether the current-path hook is already installed, and **substring match**
   (`contains("claude-session-track")`) to clean up stale copies left by path

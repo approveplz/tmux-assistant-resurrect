@@ -1074,6 +1074,8 @@ STATE_DIR="$TEST_STATE_DIR"
 assert_eq "Codex resume extraction" "ses_codex_789" "$(get_codex_session 99999 "codex resume ses_codex_789")"
 assert_eq "Codex resume with path" "ses_codex_789" "$(get_codex_session 99999 "/usr/bin/codex resume ses_codex_789")"
 assert_eq "Codex bare (no resume)" "" "$(get_codex_session 99999 "codex")"
+assert_eq "Codex rejects option as resume session ID" "" \
+	"$(get_codex_session 99999 "codex 019f87e5-7405-7a90-92f1-f771f415a32f resume --include-non-interactive")"
 
 # --- Codex: state_*.sqlite thread DB (Method 3) ---
 # Codex >= ~0.118 persists thread state in SQLite. The save script queries
@@ -1982,11 +1984,27 @@ awk_detect_tool_save() {
 	local line="$1"
 	echo "$line" | awk '
 		{
-			if      ($0 ~ /(^claude( |$)|\/claude( |$))/)                                    print "claude"
-			else if ($0 ~ /(^opencode( |$)|\/opencode( |$))/ && $0 !~ /opencode run /)      print "opencode"
-			else if ($0 ~ /(^codex( |$)|\/codex( |$))/)                                      print "codex"
-			else if ($0 ~ /(^pi( |$)|\/pi( |$))/)                                            print "pi"
-			else if ($0 ~ /(^omp( |$)|\/omp( |$))/ && $0 !~ /__omp_worker_/)              print "omp"
+			nwords = split($0, words, /[ \t]+/)
+			executable = words[1]
+			sub(/^.*\//, "", executable)
+			arg_start = 2
+			if (executable ~ /^(node|nodejs|bun|bash|sh|zsh)$/ && nwords >= 2) {
+				executable = words[2]
+				sub(/^.*\//, "", executable)
+				arg_start = 3
+			}
+			tool_args = ""
+			for (i = arg_start; i <= nwords; i++) {
+				tool_args = tool_args (tool_args == "" ? "" : " ") words[i]
+			}
+
+			if      (executable == "claude")                                                print "claude"
+			else if (executable == "opencode" && tool_args !~ /^run( |$)/)                 print "opencode"
+			else if ((executable == "codex" || executable ~ /^codex-[^-]+-[^-]+-.+/) &&
+			         tool_args !~ /^app-server( |$)/)                                       print "codex"
+			else if (executable == "pi")                                                    print "pi"
+			else if (executable == "omp" && tool_args !~ /(^| )__omp_worker_/)             print "omp"
+			else if (executable == "grok")                                                  print "grok"
 		}
 	'
 }
@@ -2011,6 +2029,14 @@ assert_eq "detect '/opt/homebrew/bin/opencode -s ses_456'" "opencode" "$(detect_
 assert_eq "detect '/bin/bash /usr/local/bin/opencode -s ses_456'" "opencode" "$(detect_tool "/bin/bash /usr/local/bin/opencode -s ses_456")"
 assert_eq "detect '/usr/local/bin/pi --session 019e99-test'" "pi" "$(detect_tool "/usr/local/bin/pi --session 019e99-test")"
 assert_eq "detect '/usr/local/bin/omp --resume 019e99-test'" "omp" "$(detect_tool "/usr/local/bin/omp --resume 019e99-test")"
+assert_eq "ignore script recorder containing codex path" "" \
+	"$(detect_tool "script -q /tmp/codex-session.capture /opt/homebrew/bin/codex")"
+assert_eq "detect native Codex platform binary" "codex" \
+	"$(detect_tool "/opt/homebrew/lib/codex-aarch64-apple-darwin resume 019f9002-5e60-71c1-9370-9dce36b415e0")"
+assert_eq "ignore internal Codex app-server" "" \
+	"$(detect_tool "/Applications/ChatGPT.app/Contents/Resources/codex app-server --listen stdio://")"
+assert_eq "ignore interpreted internal Codex app-server" "" \
+	"$(detect_tool "node /opt/homebrew/bin/codex app-server --listen stdio://")"
 
 # LSP subprocess exclusion
 assert_eq "exclude 'opencode run pyright'" "" "$(detect_tool "opencode run pyright-langserver.js")"
@@ -2033,6 +2059,10 @@ parity_cases=(
 	"bash /usr/local/bin/opencode -s ses_456|opencode"
 	"codex resume ses_789|codex"
 	"/usr/bin/codex resume ses_789|codex"
+	"/opt/homebrew/lib/codex-aarch64-apple-darwin resume 019f9002-5e60-71c1-9370-9dce36b415e0|codex"
+	"script -q /tmp/codex-session.capture /opt/homebrew/bin/codex|"
+	"/Applications/ChatGPT.app/Contents/Resources/codex app-server --listen stdio://|"
+	"node /opt/homebrew/bin/codex app-server --listen stdio://|"
 	"pi --session 019e99-test|pi"
 	"/usr/local/bin/pi --session 019e99-test|pi"
 	"omp --resume 019e99-test|omp"
@@ -2133,6 +2163,29 @@ if pane_has_assistant "$guard_empty_pid" >/dev/null 2>&1; then
 else
 	pass "pane_has_assistant correctly ignores non-assistant pane"
 fi
+
+# macOS can print a child before its parent. The traversal must still reach the
+# real assistant without mistaking its recorder wrapper for Codex.
+unordered_snapshot=$(cat <<'UNORDERED'
+300 200 /opt/homebrew/bin/codex resume 019f9002-5e60-71c1-9370-9dce36b415e0
+100 1 -zsh
+200 100 script -q /tmp/codex-session.capture /opt/homebrew/bin/codex
+UNORDERED
+)
+assert_eq "pane_has_assistant handles child-before-parent ps output" "300" \
+	"$(pane_has_assistant 100 "$unordered_snapshot")"
+
+# Internal Codex helpers are descendants of the real TUI but are not resumable.
+internal_first_snapshot=$(cat <<'INTERNAL_FIRST'
+19506 91259 /Applications/ChatGPT.app/Contents/Resources/codex app-server --listen stdio://
+91259 96440 /Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl
+96440 96439 /opt/homebrew/bin/codex resume 019fc879-273d-7353-ae07-0ba21262da23
+96439 71774 script -q /tmp/codex-session.capture /opt/homebrew/bin/codex
+71774 1 -zsh
+INTERNAL_FIRST
+)
+assert_eq "pane_has_assistant skips internal Codex app-server" "96440" \
+	"$(pane_has_assistant 71774 "$internal_first_snapshot")"
 
 # Clean up guard test sessions
 for s in test-guard-direct test-guard-wrapper test-guard-pi test-guard-empty; do
@@ -2806,6 +2859,13 @@ assert_eq "Codex strip resume" "--full-auto" \
 # Codex: bare resume (no extra flags)
 assert_eq "Codex bare resume" "" \
 	"$(extract_cli_args "codex" "codex resume ses_abc")"
+
+assert_eq "Codex discards rewritten process-title args" "" \
+	"$(extract_cli_args "codex" "codex 019f87e5-7405-7a90-92f1-f771f415a32f resume --include-non-interactive")"
+assert_eq "Codex discards recorder wrapper args" "" \
+	"$(extract_cli_args "codex" "script -q /tmp/codex-session.capture /opt/homebrew/bin/codex")"
+assert_eq "Codex discards internal app-server args" "" \
+	"$(extract_cli_args "codex" "codex app-server --listen stdio://")"
 
 # Pi: strip --session <id>
 assert_eq "Pi strip --session" "--model sonnet" \
@@ -3722,6 +3782,47 @@ assert_contains "Bracket model: model name quoted" "$bracket_log" "'claude-opus-
 assert_contains "Bracket model: uses command claude" "$bracket_log" "command claude"
 
 kill_pane_children test-restore-bracket true
+
+# --- Test 10g: Restore sanitizes legacy Codex app-server args ---
+
+suite "restore_codex_internal_args"
+echo ""
+echo "=== Test 10g: restore sanitizes Codex app-server args ==="
+echo ""
+
+tmux new-session -d -s test-restore-codex-internal -c /tmp 2>/dev/null || true
+sleep 0.5
+
+cat >"$HOME/.tmux/resurrect/assistant-sessions.json" <<'RCODEXINTERNAL'
+{
+  "timestamp": "2026-01-01T00:00:00Z",
+  "sessions": [
+    {
+      "pane": "test-restore-codex-internal:0.0",
+      "tool": "codex",
+      "session_id": "019fa516-18a0-7181-a1db-ed65442ef2f8",
+      "cwd": "/tmp",
+      "pid": "99999",
+      "cli_args": "app-server --listen stdio://",
+      "env": {}
+    }
+  ]
+}
+RCODEXINTERNAL
+
+>"$RESTORE_LOG"
+just restore 2>&1
+
+codex_internal_log=$(cat "$RESTORE_LOG")
+assert_contains "Codex internal args: uses top-level resume" "$codex_internal_log" \
+	"command codex resume '019fa516-18a0-7181-a1db-ed65442ef2f8'"
+if echo "$codex_internal_log" | grep -q "command codex app-server"; then
+	fail "Codex internal args: replayed app-server"
+else
+	pass "Codex internal args: app-server excluded"
+fi
+
+kill_pane_children test-restore-codex-internal true
 
 # --- Regression guard: no pre-fork heredoc/here-string pipes (issue #48) ---
 # The save hook must never feed a program to python3/jq through a shell heredoc
