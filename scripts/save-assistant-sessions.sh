@@ -397,8 +397,8 @@ codex_open_file_paths() {
 }
 
 get_codex_session_from_open_files() {
-	local child_pid="$1" file sid metadata metadata_sid
-	local ids="" root_ids=""
+	local child_pid="$1" file sid metadata metadata_record metadata_sid metadata_kind
+	local ids="" root_ids="" subagent_ids=""
 
 	while IFS= read -r file; do
 		case "$file" in
@@ -414,13 +414,23 @@ get_codex_session_from_open_files() {
 			# the one non-subagent rollout is the pane's resumable root.
 			metadata=""
 			[ ! -r "$file" ] || IFS= read -r metadata <"$file" || true
-			metadata_sid=$(printf '%s\n' "$metadata" | jq -r '
+			metadata_record=$(printf '%s\n' "$metadata" | jq -r '
 				select(.type == "session_meta")
-				| select((.payload.source | type) != "object" or (.payload.source | has("subagent") | not))
-				| .payload.id // empty
+				| [
+					.payload.id,
+					if ((.payload.source | type) == "object" and (.payload.source | has("subagent")))
+					then "subagent" else "root" end
+				]
+				| @tsv
 			' 2>/dev/null || true)
+			metadata_sid="${metadata_record%%$'\t'*}"
+			metadata_kind="${metadata_record#*$'\t'}"
 			if [ "$metadata_sid" = "$sid" ] && is_codex_session_id "$metadata_sid"; then
-				root_ids="${root_ids}${metadata_sid}"$'\n'
+				if [ "$metadata_kind" = "subagent" ]; then
+					subagent_ids="${subagent_ids}${metadata_sid}"$'\n'
+				else
+					root_ids="${root_ids}${metadata_sid}"$'\n'
+				fi
 			fi
 			;;
 		*) continue ;;
@@ -437,9 +447,12 @@ get_codex_session_from_open_files() {
 	esac
 
 	# Older/startup layouts may expose one exact ID without readable metadata.
-	# Accept that only when the process owns no competing candidate.
+	# Accept that only when the process owns no competing candidate and the ID
+	# was not explicitly identified as a subagent.
 	ids=$(printf '%s' "$ids" | sed '/^$/d' | LC_ALL=C sort -u)
 	case "$ids" in '' | *$'\n'*) return 0 ;; esac
+	subagent_ids=$(printf '%s' "$subagent_ids" | sed '/^$/d' | LC_ALL=C sort -u)
+	[ "$ids" != "$subagent_ids" ] || return 0
 	printf '%s\n' "$ids"
 }
 

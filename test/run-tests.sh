@@ -1194,11 +1194,13 @@ codex_open_sid="11111111-2222-4333-8444-555555555555"
 codex_open_lock="$CODEX_OPEN_TEST_DIR/thread-writer-locks/${codex_open_sid}.lock"
 codex_open_rollout="$CODEX_OPEN_TEST_DIR/sessions/rollout-2026-08-13T00-00-00-${codex_open_sid}.jsonl"
 
-python3 - "$codex_open_lock" "$codex_open_rollout" <<'PY' >/dev/null 2>&1 &
-import sys, time
-files = [open(path, "a") for path in sys.argv[1:]]
-time.sleep(30)
-PY
+hold_codex_files_open() {
+	exec 3>>"$1"
+	[ -z "${2:-}" ] || exec 4>>"$2"
+	sleep 30
+}
+
+hold_codex_files_open "$codex_open_lock" "$codex_open_rollout" &
 codex_open_pid=$!
 
 codex_open_actual=""
@@ -1215,16 +1217,11 @@ codex_root_sid="22222222-3333-4444-8555-666666666666"
 codex_subagent_sid="33333333-4444-4555-8666-777777777777"
 codex_root_rollout="$CODEX_OPEN_TEST_DIR/sessions/rollout-root-${codex_root_sid}.jsonl"
 codex_subagent_rollout="$CODEX_OPEN_TEST_DIR/sessions/rollout-subagent-${codex_subagent_sid}.jsonl"
-python3 - "$codex_root_rollout" "$codex_root_sid" "$codex_subagent_rollout" "$codex_subagent_sid" <<'PY' >/dev/null 2>&1 &
-import json, sys, time
-root_path, root_id, subagent_path, subagent_id = sys.argv[1:]
-with open(root_path, "w") as file:
-    file.write(json.dumps({"type": "session_meta", "payload": {"id": root_id, "source": "cli"}}) + "\n")
-with open(subagent_path, "w") as file:
-    file.write(json.dumps({"type": "session_meta", "payload": {"id": subagent_id, "source": {"subagent": {}}}}) + "\n")
-files = [open(root_path, "a"), open(subagent_path, "a")]
-time.sleep(30)
-PY
+printf '{"type":"session_meta","payload":{"id":"%s","source":"cli"}}\n' \
+	"$codex_root_sid" >"$codex_root_rollout"
+printf '{"type":"session_meta","payload":{"id":"%s","source":{"subagent":{}}}}\n' \
+	"$codex_subagent_sid" >"$codex_subagent_rollout"
+hold_codex_files_open "$codex_root_rollout" "$codex_subagent_rollout" &
 codex_subagent_pid=$!
 
 codex_root_actual=""
@@ -1238,12 +1235,23 @@ assert_eq "Codex distinguishes pane root from open subagent sessions" \
 kill "$codex_subagent_pid" 2>/dev/null || true
 wait "$codex_subagent_pid" 2>/dev/null || true
 
+hold_codex_files_open "$codex_subagent_rollout" &
+codex_subagent_only_pid=$!
+for _i in $(seq 1 50); do
+	codex_subagent_only_count=$(codex_open_file_paths "$codex_subagent_only_pid" | grep -c '/rollout-' || true)
+	[ "$codex_subagent_only_count" -ge 1 ] && break
+	sleep 0.1
+done
+assert_eq "Codex rejects a subagent-only open session" "" \
+	"$(get_codex_session_from_open_files "$codex_subagent_only_pid")"
+assert_eq "Codex falls through a subagent-only open session to exact argv" \
+	"$codex_root_sid" "$(get_codex_session "$codex_subagent_only_pid" "codex resume $codex_root_sid")"
+kill "$codex_subagent_only_pid" 2>/dev/null || true
+wait "$codex_subagent_only_pid" 2>/dev/null || true
+
 codex_ambiguous_sid="aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
-python3 - "$codex_open_lock" "$CODEX_OPEN_TEST_DIR/thread-writer-locks/${codex_ambiguous_sid}.lock" <<'PY' >/dev/null 2>&1 &
-import sys, time
-files = [open(path, "a") for path in sys.argv[1:]]
-time.sleep(30)
-PY
+hold_codex_files_open "$codex_open_lock" \
+	"$CODEX_OPEN_TEST_DIR/thread-writer-locks/${codex_ambiguous_sid}.lock" &
 codex_ambiguous_pid=$!
 
 for _i in $(seq 1 50); do
@@ -1256,6 +1264,7 @@ assert_eq "Codex rejects ambiguous PID-owned session IDs" "" \
 kill "$codex_ambiguous_pid" 2>/dev/null || true
 wait "$codex_ambiguous_pid" 2>/dev/null || true
 rm -rf "$CODEX_OPEN_TEST_DIR"
+unset -f hold_codex_files_open
 
 # Every exact source must reject an ID already assigned to another pane.
 USED_CODEX_SESSION_IDS=""
