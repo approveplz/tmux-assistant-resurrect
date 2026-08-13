@@ -2,7 +2,7 @@
 # The tmux server may have been started with a limited PATH (e.g. via a
 # systemd user service with a whitelisted runtime environment). That PATH
 # is inherited by every hook this script runs in, so utilities like
-# python3 — needed by Python-based session lookup methods (Codex + pi) —
+# python3 — needed by Python-based session lookup methods —
 # can be missing even though they are installed and work fine from an
 # interactive shell. Augment PATH with common system locations so the
 # hook context sees what the rest of the system sees.
@@ -364,27 +364,113 @@ is_codex_session_id() {
 		grep -Eq '^(ses_[A-Za-z0-9_-]+|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$'
 }
 
+codex_session_id_available() {
+	local sid="${1:-}"
+	is_codex_session_id "$sid" || return 1
+	case "${USED_CODEX_SESSION_IDS}"$'\t' in
+	*$'\t'"$sid"$'\t'*) return 1 ;;
+	esac
+	return 0
+}
+
+codex_open_file_paths() {
+	local child_pid="$1"
+	case "$child_pid" in '' | *[!0-9]* | 0 | 1) return 0 ;; esac
+
+	local proc_fd_dir="/proc/${child_pid}/fd"
+	if [ -d "$proc_fd_dir" ]; then
+		local fd path
+		for fd in "$proc_fd_dir"/*; do
+			path=$(readlink "$fd" 2>/dev/null) || continue
+			printf '%s\n' "$path"
+		done
+		return 0
+	fi
+
+	# macOS has no /proc. lsof is part of the base system, but /usr/sbin may
+	# be absent from the PATH inherited by a long-lived tmux server.
+	local lsof_bin=""
+	lsof_bin=$(command -v lsof 2>/dev/null || true)
+	[ -n "$lsof_bin" ] || [ ! -x /usr/sbin/lsof ] || lsof_bin=/usr/sbin/lsof
+	[ -n "$lsof_bin" ] || return 0
+	"$lsof_bin" -n -Fn -a -p "$child_pid" 2>/dev/null | sed -n 's/^n//p' || true
+}
+
+get_codex_session_from_open_files() {
+	local child_pid="$1" file sid metadata metadata_sid
+	local ids="" root_ids=""
+
+	while IFS= read -r file; do
+		case "$file" in
+		*/thread-writer-locks/*.lock)
+			sid="${file##*/}"
+			sid="${sid%.lock}"
+			;;
+		*/rollout-*.jsonl)
+			sid=$(printf '%s\n' "$file" | sed -n \
+				's#^.*/rollout-.*-\([0-9a-fA-F]\{8\}-[0-9a-fA-F]\{4\}-[0-9a-fA-F]\{4\}-[0-9a-fA-F]\{4\}-[0-9a-fA-F]\{12\}\)\.jsonl$#\1#p')
+			# Subagent threads share the root process and therefore its open-file
+			# table. Their session_meta source is explicitly tagged `subagent`;
+			# the one non-subagent rollout is the pane's resumable root.
+			metadata=""
+			[ ! -r "$file" ] || IFS= read -r metadata <"$file" || true
+			metadata_sid=$(printf '%s\n' "$metadata" | jq -r '
+				select(.type == "session_meta")
+				| select((.payload.source | type) != "object" or (.payload.source | has("subagent") | not))
+				| .payload.id // empty
+			' 2>/dev/null || true)
+			if [ "$metadata_sid" = "$sid" ] && is_codex_session_id "$metadata_sid"; then
+				root_ids="${root_ids}${metadata_sid}"$'\n'
+			fi
+			;;
+		*) continue ;;
+		esac
+		is_codex_session_id "$sid" || continue
+		ids="${ids}${sid}"$'\n'
+	done < <(codex_open_file_paths "$child_pid")
+
+	root_ids=$(printf '%s' "$root_ids" | sed '/^$/d' | LC_ALL=C sort -u)
+	case "$root_ids" in
+	'') ;;
+	*$'\n'*) return 0 ;;
+	*) printf '%s\n' "$root_ids"; return 0 ;;
+	esac
+
+	# Older/startup layouts may expose one exact ID without readable metadata.
+	# Accept that only when the process owns no competing candidate.
+	ids=$(printf '%s' "$ids" | sed '/^$/d' | LC_ALL=C sort -u)
+	case "$ids" in '' | *$'\n'*) return 0 ;; esac
+	printf '%s\n' "$ids"
+}
+
 get_codex_session() {
 	local child_pid="$1"
 	local args="$2"
-	local cwd="${3:-}"
+	local sid
 
-	# Method 1: session-tags.jsonl (written by Codex at runtime)
+	# Primary: the live process keeps its writer lock and rollout file open.
+	# Resolve those PID-owned files through /proc on Linux/WSL or lsof on macOS,
+	# and use rollout metadata to separate the pane root from its subagents.
+	sid=$(get_codex_session_from_open_files "$child_pid")
+	if codex_session_id_available "$sid"; then
+		echo "$sid"
+		return
+	fi
+
+	# Fallback 1: session-tags.jsonl from Codex versions that publish it.
 	local tags_file="${HOME}/.codex/session-tags.jsonl"
 	if [ -f "$tags_file" ]; then
-		local sid
 		sid=$(grep "\"pid\": *${child_pid}[,}]" "$tags_file" 2>/dev/null |
 			tail -1 |
 			jq -r '.session // empty' 2>/dev/null || true)
-		if is_codex_session_id "$sid"; then
+		if codex_session_id_available "$sid"; then
 			echo "$sid"
 			return
 		fi
 	fi
 
-	# Method 2: resume arg in process args (chicken-and-egg fallback)
+	# Fallback 2: resume arg in process args (chicken-and-egg fallback).
 	# After restore, codex is launched as `codex resume <session_id>`.
-	local sid
 	sid=$(printf '%s\n' "$args" | awk '
 		{
 			for (i = 1; i < NF; i++) {
@@ -395,60 +481,9 @@ get_codex_session() {
 			}
 		}
 	')
-	if is_codex_session_id "$sid"; then
+	if codex_session_id_available "$sid"; then
 		echo "$sid"
 		return
-	fi
-
-	# Method 3: Codex thread state DB (Codex >= ~0.118 persist state in
-	# SQLite: ~/.codex/state_*.sqlite, table `threads`, columns id/cwd/
-	# updated_at/archived).  This is the canonical current source — codex
-	# writes a `threads` row per session and bumps `updated_at` on every
-	# user turn.  A long-lived session that started days ago keeps its
-	# same `id` in this table even though no new rollout JSONL is ever
-	# written, which is exactly the case Method 4 misses.
-	#
-	# Strategy: among threads matching our process's cwd that are unarchived
-	# and have been updated during this process's lifetime, pick the most
-	# recently updated one that isn't already assigned to another pane.
-	#
-	# The DB file is versioned (state_5.sqlite, bumping on schema changes).
-	# We glob for state_*.sqlite inside python3 (avoids `ls -t` pipe and
-	# handles spaces in paths cleanly) and pick the newest by mtime.
-	if [ -n "$cwd" ] && command -v python3 >/dev/null 2>&1; then
-		local process_start
-		process_start=$(get_process_start_epoch "$child_pid")
-		sid=$(
-			USED_CODEX_SESSION_IDS="$USED_CODEX_SESSION_IDS" python3 "$PY_DIR/codex_state_db.py" "$HOME/.codex" "$cwd" "$process_start"
-		)
-		if is_codex_session_id "$sid"; then
-			echo "$sid"
-			return
-		fi
-	fi
-
-	# Method 4: Codex rollout session files (Codex ~0.100-0.117 wrote
-	# these; newer versions have moved to SQLite, see Method 3).
-	# Releases in that window persisted session metadata under
-	# ~/.codex/sessions/*/*.jsonl and included a session_meta record
-	# with both id and cwd.
-	# We rank candidates by:
-	# - matching cwd
-	# - preferring session IDs not already assigned during this save
-	# - preferring sessions created before the current process start time
-	# - preferring sessions closest to the current process start time
-	# - preferring recently modified rollout files
-	local sessions_root="${HOME}/.codex/sessions"
-	if [ -n "$cwd" ] && [ -d "$sessions_root" ] && command -v python3 >/dev/null 2>&1; then
-		local process_start
-		process_start=$(get_process_start_epoch "$child_pid")
-		sid=$(
-			USED_CODEX_SESSION_IDS="$USED_CODEX_SESSION_IDS" python3 "$PY_DIR/codex_rollout.py" "$sessions_root" "$cwd" "$process_start"
-		)
-		if is_codex_session_id "$sid"; then
-			echo "$sid"
-			return
-		fi
 	fi
 }
 
@@ -781,8 +816,8 @@ get_grok_session() {
 register_codex_session_id() {
 	local sid="$1"
 	[ -z "$sid" ] && return
-	case "$USED_CODEX_SESSION_IDS" in
-	*"$sid"*) ;;
+	case "${USED_CODEX_SESSION_IDS}"$'\t' in
+	*$'\t'"$sid"$'\t'*) ;;
 	*)
 		USED_CODEX_SESSION_IDS="${USED_CODEX_SESSION_IDS}"$'\t'"$sid"
 		;;

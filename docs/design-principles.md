@@ -41,8 +41,10 @@ before hooks/plugins have fired):
   state file (fallback for runtime session switches); SQLite database query
   at `~/.local/share/opencode/opencode.db` matching the pane's cwd (version-
   resilient fallback when the plugin hasn't fired)
-- **Codex CLI**: PID lookup in `~/.codex/session-tags.jsonl` (primary);
-  `resume <id>` in process args (fallback)
+- **Codex CLI**: exact root session ID from rollout files held by the live PID,
+  excluding rollouts whose metadata identifies them as subagents (primary);
+  PID lookup in `~/.codex/session-tags.jsonl`, then `resume <id>` in process
+  args (fallbacks). Ambiguous, duplicate, and cwd-only matches are rejected.
 - **Pi**: `--session <id>` in process args (fallback); session header lookup in
   `~/.pi/agent/sessions/--<cwd>--/*.jsonl` (primary for fresh sessions)
 - **Oh My Pi**: `--resume <id>` / `-r <id>` in process args (fallback);

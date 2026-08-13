@@ -1183,203 +1183,101 @@ assert_eq "Codex bare (no resume)" "" "$(get_codex_session 99999 "codex")"
 assert_eq "Codex rejects option as resume session ID" "" \
 	"$(get_codex_session 99999 "codex 019f87e5-7405-7a90-92f1-f771f415a32f resume --include-non-interactive")"
 
-# --- Codex: state_*.sqlite thread DB (Method 3) ---
-# Codex >= ~0.118 persists thread state in SQLite. The save script queries
-# the threads table by cwd, preferring recently-updated unarchived threads.
-
+# --- Codex: exact PID-owned writer files ---
 echo ""
-echo "=== Codex state DB: thread lookup via state_*.sqlite ==="
+echo "=== Codex exact process-to-session lookup ==="
 echo ""
 
-STATEDB_TEST_DIR=$(mktemp -d)
-mkdir -p "$STATEDB_TEST_DIR/.codex"
+CODEX_OPEN_TEST_DIR=$(mktemp -d)
+mkdir -p "$CODEX_OPEN_TEST_DIR/thread-writer-locks" "$CODEX_OPEN_TEST_DIR/sessions"
+codex_open_sid="11111111-2222-4333-8444-555555555555"
+codex_open_lock="$CODEX_OPEN_TEST_DIR/thread-writer-locks/${codex_open_sid}.lock"
+codex_open_rollout="$CODEX_OPEN_TEST_DIR/sessions/rollout-2026-08-13T00-00-00-${codex_open_sid}.jsonl"
 
-# Create a test state DB with the threads table
-python3 - "$STATEDB_TEST_DIR/.codex/state_5.sqlite" <<'DBSETUP'
-import sqlite3, sys, time
-db = sys.argv[1]
-conn = sqlite3.connect(db)
-conn.execute('''CREATE TABLE threads (
-    id TEXT PRIMARY KEY,
-    rollout_path TEXT NOT NULL,
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL,
-    source TEXT NOT NULL,
-    model_provider TEXT NOT NULL,
-    cwd TEXT NOT NULL,
-    title TEXT NOT NULL,
-    sandbox_policy TEXT NOT NULL,
-    approval_mode TEXT NOT NULL,
-    tokens_used INTEGER NOT NULL DEFAULT 0,
-    has_user_event INTEGER NOT NULL DEFAULT 0,
-    archived INTEGER NOT NULL DEFAULT 0,
-    archived_at INTEGER
-)''')
-now = int(time.time())
-# Active thread matching test cwd — updated recently
-conn.execute('''INSERT INTO threads (id, rollout_path, created_at, updated_at, source,
-    model_provider, cwd, title, sandbox_policy, approval_mode)
-    VALUES (?, '', ?, ?, 'cli', 'openai', '/tmp/statedb-project', 'active', 'relaxed', 'auto')''',
-    ('ses_statedb_active', now - 3600, now - 10))
-# Older thread same cwd — should lose to the active one
-conn.execute('''INSERT INTO threads (id, rollout_path, created_at, updated_at, source,
-    model_provider, cwd, title, sandbox_policy, approval_mode)
-    VALUES (?, '', ?, ?, 'cli', 'openai', '/tmp/statedb-project', 'old', 'relaxed', 'auto')''',
-    ('ses_statedb_old', now - 86400, now - 86400))
-# Archived thread same cwd — should be excluded
-conn.execute('''INSERT INTO threads (id, rollout_path, created_at, updated_at, source,
-    model_provider, cwd, title, sandbox_policy, approval_mode, archived, archived_at)
-    VALUES (?, '', ?, ?, 'cli', 'openai', '/tmp/statedb-project', 'archived', 'relaxed', 'auto', 1, ?)''',
-    ('ses_statedb_archived', now - 7200, now - 5, now - 5))
-# Thread in different cwd — should not match
-conn.execute('''INSERT INTO threads (id, rollout_path, created_at, updated_at, source,
-    model_provider, cwd, title, sandbox_policy, approval_mode)
-    VALUES (?, '', ?, ?, 'cli', 'openai', '/tmp/other-project', 'other', 'relaxed', 'auto')''',
-    ('ses_statedb_other', now - 100, now - 1))
-conn.commit()
-conn.close()
-DBSETUP
+python3 - "$codex_open_lock" "$codex_open_rollout" <<'PY' >/dev/null 2>&1 &
+import sys, time
+files = [open(path, "a") for path in sys.argv[1:]]
+time.sleep(30)
+PY
+codex_open_pid=$!
 
-ORIG_HOME="$HOME"
-HOME="$STATEDB_TEST_DIR"
-
-# Should find the most recently updated active thread for the matching cwd
-statedb_sid=$(get_codex_session $$ "codex" "/tmp/statedb-project")
-assert_eq "Codex state DB: finds active thread by cwd" "ses_statedb_active" "$statedb_sid"
-
-# Should NOT match a different cwd
-statedb_miss=$(get_codex_session $$ "codex" "/tmp/nonexistent")
-assert_eq "Codex state DB: no match for different cwd" "" "$statedb_miss"
-
-# Dedup: after claiming ses_statedb_active, next call should get ses_statedb_old
-USED_CODEX_SESSION_IDS=""
-statedb_first=$(get_codex_session $$ "codex" "/tmp/statedb-project")
-register_codex_session_id "$statedb_first"
-statedb_second=$(get_codex_session $$ "codex" "/tmp/statedb-project")
-
-if [ -n "$statedb_first" ] && [ -n "$statedb_second" ] && [ "$statedb_first" != "$statedb_second" ]; then
-	pass "Codex state DB dedup: two calls get distinct sessions ($statedb_first vs $statedb_second)"
-else
-	fail "Codex state DB dedup: expected distinct sessions, got '$statedb_first' and '$statedb_second'"
-fi
-USED_CODEX_SESSION_IDS=""
-
-# Should prefer state DB (Method 3) over rollout JSONL (Method 4) when both exist
-mkdir -p "$STATEDB_TEST_DIR/.codex/sessions/2026/04/23"
-cat >"$STATEDB_TEST_DIR/.codex/sessions/2026/04/23/rollout-statedb-test.jsonl" <<'ROLLOUT'
-{"timestamp":"2026-04-23T10:00:00.000Z","type":"session_meta","payload":{"id":"ses_rollout_loser","timestamp":"2026-04-23T10:00:00.000Z","cwd":"/tmp/statedb-project","originator":"codex_cli_rs","cli_version":"0.116.0"}}
-ROLLOUT
-
-statedb_priority=$(get_codex_session $$ "codex" "/tmp/statedb-project")
-assert_eq "Codex state DB takes priority over rollout JSONL" "ses_statedb_active" "$statedb_priority"
-
-HOME="$ORIG_HOME"
-rm -rf "$STATEDB_TEST_DIR"
-
-# --- Codex: rollout session files (Method 4) ---
-# Codex ~0.100-0.117 wrote session metadata to ~/.codex/sessions/*/*.jsonl.
-# Newer versions use SQLite (Method 3). Test the JSONL fallback.
-
-ROLLOUT_TEST_DIR=$(mktemp -d)
-mkdir -p "$ROLLOUT_TEST_DIR/.codex/sessions/2026/03/24"
-
-# Create a rollout file matching cwd=/tmp/test-project
-cat >"$ROLLOUT_TEST_DIR/.codex/sessions/2026/03/24/rollout-2026-03-24T10-00-00-ses_rollout_aaa.jsonl" <<'ROLLOUT'
-{"timestamp":"2026-03-24T10:00:00.000Z","type":"session_meta","payload":{"id":"ses_rollout_aaa","timestamp":"2026-03-24T10:00:00.000Z","cwd":"/tmp/test-project","originator":"codex_cli_rs","cli_version":"0.116.0"}}
-ROLLOUT
-
-# Override HOME so get_codex_session looks in our test dir
-ORIG_HOME="$HOME"
-HOME="$ROLLOUT_TEST_DIR"
-
-# Should find session by cwd match (use $$ as a live PID so get_process_start_epoch works)
-rollout_sid=$(get_codex_session $$ "codex" "/tmp/test-project")
-assert_eq "Codex rollout session file lookup by cwd" "ses_rollout_aaa" "$rollout_sid"
-
-# Should NOT match a different cwd
-rollout_sid_miss=$(get_codex_session $$ "codex" "/tmp/other-project")
-assert_eq "Codex rollout no match for different cwd" "" "$rollout_sid_miss"
-
-# --- Codex rollout: dedup across panes (USED_CODEX_SESSION_IDS) ---
-# When two panes share the same cwd, the second should get a different session.
-
-# Add a second rollout file for the same cwd
-cat >"$ROLLOUT_TEST_DIR/.codex/sessions/2026/03/24/rollout-2026-03-24T10-01-00-ses_rollout_bbb.jsonl" <<'ROLLOUT'
-{"timestamp":"2026-03-24T10:01:00.000Z","type":"session_meta","payload":{"id":"ses_rollout_bbb","timestamp":"2026-03-24T10:01:00.000Z","cwd":"/tmp/test-project","originator":"codex_cli_rs","cli_version":"0.116.0"}}
-ROLLOUT
-
-# First call picks one session
-USED_CODEX_SESSION_IDS=""
-dedup_first=$(get_codex_session $$ "codex" "/tmp/test-project")
-
-# Register it (simulating what emit_session does)
-if type register_codex_session_id >/dev/null 2>&1; then
-	register_codex_session_id "$dedup_first"
-fi
-
-# Second call should pick the OTHER session
-dedup_second=$(get_codex_session $$ "codex" "/tmp/test-project")
-
-# They must both be non-empty and different
-if [ -n "$dedup_first" ] && [ -n "$dedup_second" ] && [ "$dedup_first" != "$dedup_second" ]; then
-	pass "Codex rollout dedup: two panes same cwd get distinct sessions"
-else
-	fail "Codex rollout dedup: expected distinct sessions, got '$dedup_first' and '$dedup_second'"
-fi
-
-HOME="$ORIG_HOME"
-rm -rf "$ROLLOUT_TEST_DIR"
-
-# --- Codex rollout: restricted PATH (regression for PATH augmentation) ---
-# When the tmux server inherits a stripped PATH (e.g. systemd user service),
-# python3 may not be found. The save script augments PATH at startup so that
-# python3-based methods (Codex rollout, OpenCode DB) still work.
-
-echo ""
-echo "=== PATH augmentation: Codex rollout works under restricted PATH ==="
-echo ""
-
-PATH_TEST_DIR=$(mktemp -d)
-mkdir -p "$PATH_TEST_DIR/.codex/sessions/2026/04/23"
-cat >"$PATH_TEST_DIR/.codex/sessions/2026/04/23/rollout-path-test.jsonl" <<'PATHROLLOUT'
-{"timestamp":"2026-04-23T10:00:00.000Z","type":"session_meta","payload":{"id":"ses_path_repro","timestamp":"2026-04-23T10:00:00.000Z","cwd":"/tmp/path-repro","originator":"codex_cli_rs","cli_version":"0.116.0"}}
-PATHROLLOUT
-
-# Build a minimal PATH that has the coreutils the script needs but NOT python3
-rbin=$(mktemp -d)
-for _c in dirname mkdir sed ps tr tail mv cat date jq awk gzip tar md5sum; do
-	_p=$(command -v "$_c" 2>/dev/null || true)
-	[ -n "$_p" ] && ln -sf "$_p" "$rbin/$_c"
+codex_open_actual=""
+for _i in $(seq 1 50); do
+	codex_open_actual=$(get_codex_session_from_open_files "$codex_open_pid")
+	[ -n "$codex_open_actual" ] && break
+	sleep 0.1
 done
-# Also need bash itself for the subshell (and TEST_BASH variant like bash3.2)
-ln -sf "$(command -v bash)" "$rbin/bash"
-if [ -n "${TEST_BASH:-}" ] && [ "$TEST_BASH" != "bash" ] && command -v "$TEST_BASH" >/dev/null 2>&1; then
-	ln -sf "$(command -v "$TEST_BASH")" "$rbin/$TEST_BASH"
-fi
+assert_eq "Codex open writer files map PID to exact session" "$codex_open_sid" "$codex_open_actual"
+kill "$codex_open_pid" 2>/dev/null || true
+wait "$codex_open_pid" 2>/dev/null || true
 
-# Run the save script's preamble + get_codex_session under the restricted PATH.
-# The PATH augmentation block should find python3 and make Method 3 work.
-ORIG_HOME_PATH="$HOME"
-HOME="$PATH_TEST_DIR"
-path_aug_sid=$(PATH="$rbin" ${TEST_BASH:-bash} -c '
-	source "'"$REPO_DIR"'/scripts/save-assistant-sessions.sh"
-	get_codex_session $$ "codex" "/tmp/path-repro"
-')
-HOME="$ORIG_HOME_PATH"
+codex_root_sid="22222222-3333-4444-8555-666666666666"
+codex_subagent_sid="33333333-4444-4555-8666-777777777777"
+codex_root_rollout="$CODEX_OPEN_TEST_DIR/sessions/rollout-root-${codex_root_sid}.jsonl"
+codex_subagent_rollout="$CODEX_OPEN_TEST_DIR/sessions/rollout-subagent-${codex_subagent_sid}.jsonl"
+python3 - "$codex_root_rollout" "$codex_root_sid" "$codex_subagent_rollout" "$codex_subagent_sid" <<'PY' >/dev/null 2>&1 &
+import json, sys, time
+root_path, root_id, subagent_path, subagent_id = sys.argv[1:]
+with open(root_path, "w") as file:
+    file.write(json.dumps({"type": "session_meta", "payload": {"id": root_id, "source": "cli"}}) + "\n")
+with open(subagent_path, "w") as file:
+    file.write(json.dumps({"type": "session_meta", "payload": {"id": subagent_id, "source": {"subagent": {}}}}) + "\n")
+files = [open(root_path, "a"), open(subagent_path, "a")]
+time.sleep(30)
+PY
+codex_subagent_pid=$!
 
-assert_eq "Codex rollout lookup works with restricted hook PATH" "ses_path_repro" "$path_aug_sid"
+codex_root_actual=""
+for _i in $(seq 1 50); do
+	codex_root_actual=$(get_codex_session_from_open_files "$codex_subagent_pid")
+	[ -n "$codex_root_actual" ] && break
+	sleep 0.1
+done
+assert_eq "Codex distinguishes pane root from open subagent sessions" \
+	"$codex_root_sid" "$codex_root_actual"
+kill "$codex_subagent_pid" 2>/dev/null || true
+wait "$codex_subagent_pid" 2>/dev/null || true
 
-# Verify that when python3 IS already on PATH, the augmentation is a no-op
-path_before="$PATH"
-# Re-source the script (it guards with command -v python3)
-source "$REPO_DIR/scripts/save-assistant-sessions.sh"
-if [ "$PATH" = "$path_before" ]; then
-	pass "PATH unchanged when python3 already available"
-else
-	fail "PATH was modified even though python3 was already on PATH"
-fi
+codex_ambiguous_sid="aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+python3 - "$codex_open_lock" "$CODEX_OPEN_TEST_DIR/thread-writer-locks/${codex_ambiguous_sid}.lock" <<'PY' >/dev/null 2>&1 &
+import sys, time
+files = [open(path, "a") for path in sys.argv[1:]]
+time.sleep(30)
+PY
+codex_ambiguous_pid=$!
 
-rm -rf "$PATH_TEST_DIR" "$rbin"
+for _i in $(seq 1 50); do
+	codex_ambiguous_count=$(codex_open_file_paths "$codex_ambiguous_pid" | grep -c '/thread-writer-locks/' || true)
+	[ "$codex_ambiguous_count" -ge 2 ] && break
+	sleep 0.1
+done
+assert_eq "Codex rejects ambiguous PID-owned session IDs" "" \
+	"$(get_codex_session_from_open_files "$codex_ambiguous_pid")"
+kill "$codex_ambiguous_pid" 2>/dev/null || true
+wait "$codex_ambiguous_pid" 2>/dev/null || true
+rm -rf "$CODEX_OPEN_TEST_DIR"
+
+# Every exact source must reject an ID already assigned to another pane.
+USED_CODEX_SESSION_IDS=""
+register_codex_session_id "ses_codex_789"
+assert_eq "Codex rejects duplicate resume session ID" "" \
+	"$(get_codex_session 99999 "codex resume ses_codex_789")"
+assert_eq "Codex duplicate check uses exact IDs" "ses_codex_7890" \
+	"$(get_codex_session 99999 "codex resume ses_codex_7890")"
+USED_CODEX_SESSION_IDS=""
+
+# A stale rollout with a matching cwd is not proof that its session belongs to
+# this process. Bare Codex processes without an exact signal are skipped.
+CODEX_STALE_TEST_DIR=$(mktemp -d)
+mkdir -p "$CODEX_STALE_TEST_DIR/.codex/sessions/2026/08/13"
+echo '{"type":"session_meta","payload":{"id":"ses_stale","cwd":"/tmp/shared-project"}}' \
+	>"$CODEX_STALE_TEST_DIR/.codex/sessions/2026/08/13/rollout-stale.jsonl"
+ORIG_HOME="$HOME"
+HOME="$CODEX_STALE_TEST_DIR"
+assert_eq "Codex never guesses a session from cwd" "" \
+	"$(get_codex_session 99999 "codex" "/tmp/shared-project")"
+HOME="$ORIG_HOME"
+rm -rf "$CODEX_STALE_TEST_DIR"
 
 # --- OpenCode: -s and --session arg extraction ---
 assert_eq "OpenCode -s extraction" "ses_oc_456" "$(get_opencode_session 99999 "opencode -s ses_oc_456" "/tmp")"
@@ -1777,7 +1675,7 @@ fi
 
 # --- Test 5c4d: process start-time helper (unit) ---
 #
-# get_process_start_epoch() backs Codex/Pi/OMP session matching: it distinguishes
+# get_process_start_epoch() backs Pi/OMP session matching: it distinguishes
 # the live assistant session from stale sessions sharing a cwd. It reads
 # /proc/PID/stat on Linux and elapsed time (`ps -o etime=`) on macOS/BSD (issue
 # #49 — the old `ps -o etimes=` was a GNU keyword BSD ps silently rejected).
@@ -1831,95 +1729,6 @@ assert_eq "_etime_to_seconds is empty for an unparseable value" \
 	"" "$(_etime_to_seconds "not-a-duration")"
 assert_eq "_etime_to_seconds is empty for a malformed field" \
 	"" "$(_etime_to_seconds "01::23")"
-
-# --- Test 5c4b: Codex rollout session files (e2e) ---
-#
-# When session-tags.jsonl is absent but rollout files exist under
-# ~/.codex/sessions/, the save script should extract the session ID
-# from the rollout file matching the pane's cwd.
-
-echo ""
-echo "=== Test 5c4b: Codex rollout session file (e2e) ==="
-echo ""
-
-ROLLOUT_CWD="/tmp/test-codex-rollout"
-mkdir -p "$ROLLOUT_CWD"
-
-tmux new-session -d -s test-codex-rollout -c "$ROLLOUT_CWD"
-tmux send-keys -t test-codex-rollout "codex resume ses_codex_rollout_e2e" Enter
-codex_rollout_shell_pid=$(tmux display-message -t test-codex-rollout -p '#{pane_pid}')
-wait_for_child "$codex_rollout_shell_pid" "codex" 10 >/dev/null || echo "WARN: codex child not found for rollout test"
-
-# Remove session-tags.jsonl so Method 1 cannot succeed
-rm -f "$HOME/.codex/session-tags.jsonl"
-
-# Create a rollout file that matches this pane's cwd
-mkdir -p "$HOME/.codex/sessions/2026/03/24"
-cat >"$HOME/.codex/sessions/2026/03/24/rollout-test-codex-rollout.jsonl" <<ROLLOUT
-{"timestamp":"2026-03-24T10:00:00.000Z","type":"session_meta","payload":{"id":"ses_codex_rollout_e2e","timestamp":"2026-03-24T10:00:00.000Z","cwd":"$ROLLOUT_CWD","originator":"codex_cli_rs","cli_version":"0.116.0"}}
-ROLLOUT
-
-rm -f "$HOME/.tmux/resurrect/assistant-sessions.json"
-just save 2>&1
-
-codex_rollout_sid=$(jq -r '.sessions[] | select(.pane | contains("test-codex-rollout")) | .session_id' "$HOME/.tmux/resurrect/assistant-sessions.json" 2>/dev/null)
-assert_eq "Codex rollout e2e: session ID from rollout file" "ses_codex_rollout_e2e" "$codex_rollout_sid"
-
-# Clean up
-rm -f "$HOME/.codex/sessions/2026/03/24/rollout-test-codex-rollout.jsonl"
-kill_pane_children test-codex-rollout true
-rm -rf "$ROLLOUT_CWD"
-
-# --- Test 5c4c: Codex rollout dedup — two panes same cwd (e2e) ---
-#
-# Two codex panes in the same cwd should get distinct session IDs
-# when two rollout files exist for that cwd.
-
-echo ""
-echo "=== Test 5c4c: Codex rollout dedup — two panes same cwd (e2e) ==="
-echo ""
-
-DEDUP_CWD="/tmp/test-codex-dedup"
-mkdir -p "$DEDUP_CWD"
-
-tmux new-session -d -s test-codex-dedup1 -c "$DEDUP_CWD"
-tmux send-keys -t test-codex-dedup1 "codex resume ses_dedup_pane1" Enter
-tmux new-session -d -s test-codex-dedup2 -c "$DEDUP_CWD"
-tmux send-keys -t test-codex-dedup2 "codex resume ses_dedup_pane2" Enter
-
-dedup1_shell_pid=$(tmux display-message -t test-codex-dedup1 -p '#{pane_pid}')
-dedup2_shell_pid=$(tmux display-message -t test-codex-dedup2 -p '#{pane_pid}')
-wait_for_child "$dedup1_shell_pid" "codex" 10 >/dev/null || echo "WARN: codex child not found for dedup1"
-wait_for_child "$dedup2_shell_pid" "codex" 10 >/dev/null || echo "WARN: codex child not found for dedup2"
-
-# Remove session-tags.jsonl, provide two rollout files for same cwd
-rm -f "$HOME/.codex/session-tags.jsonl"
-mkdir -p "$HOME/.codex/sessions/2026/03/24"
-cat >"$HOME/.codex/sessions/2026/03/24/rollout-test-dedup-aaa.jsonl" <<ROLLOUT
-{"timestamp":"2026-03-24T10:00:00.000Z","type":"session_meta","payload":{"id":"ses_dedup_aaa","timestamp":"2026-03-24T10:00:00.000Z","cwd":"$DEDUP_CWD","originator":"codex_cli_rs","cli_version":"0.116.0"}}
-ROLLOUT
-cat >"$HOME/.codex/sessions/2026/03/24/rollout-test-dedup-bbb.jsonl" <<ROLLOUT
-{"timestamp":"2026-03-24T10:01:00.000Z","type":"session_meta","payload":{"id":"ses_dedup_bbb","timestamp":"2026-03-24T10:01:00.000Z","cwd":"$DEDUP_CWD","originator":"codex_cli_rs","cli_version":"0.116.0"}}
-ROLLOUT
-
-rm -f "$HOME/.tmux/resurrect/assistant-sessions.json"
-just save 2>&1
-
-dedup_sid1=$(jq -r '.sessions[] | select(.pane | contains("test-codex-dedup1")) | .session_id' "$HOME/.tmux/resurrect/assistant-sessions.json" 2>/dev/null)
-dedup_sid2=$(jq -r '.sessions[] | select(.pane | contains("test-codex-dedup2")) | .session_id' "$HOME/.tmux/resurrect/assistant-sessions.json" 2>/dev/null)
-
-if [ -n "$dedup_sid1" ] && [ -n "$dedup_sid2" ] && [ "$dedup_sid1" != "$dedup_sid2" ]; then
-	pass "Codex rollout dedup e2e: two panes same cwd get distinct sessions ($dedup_sid1 vs $dedup_sid2)"
-else
-	fail "Codex rollout dedup e2e: expected distinct sessions, got '$dedup_sid1' and '$dedup_sid2'"
-fi
-
-# Clean up
-rm -f "$HOME/.codex/sessions/2026/03/24/rollout-test-dedup-aaa.jsonl"
-rm -f "$HOME/.codex/sessions/2026/03/24/rollout-test-dedup-bbb.jsonl"
-kill_pane_children test-codex-dedup1 true
-kill_pane_children test-codex-dedup2 true
-rm -rf "$DEDUP_CWD"
 
 # --- Test 5c4d: Pi --session arg fallback (chicken-and-egg, e2e) ---
 #

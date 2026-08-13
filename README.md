@@ -62,7 +62,7 @@ Session ID extraction uses tool-native mechanisms (infrastructure plumbing):
 | **Claude Code** | `SessionStart` hook state file (keyed by Claude PID) | `--resume` in process args | - | Claude overwrites its process title, so args fallback only works if args are visible |
 | **GitHub Copilot CLI** | `$COPILOT_HOME/session-state/<uuid>/inuse.<pid>.lock` written by the live session | `--session-id` / `--resume` in process args | - | Plain glob keyed on the native PID — no `/proc`, no `lsof`, so it behaves identically on Linux, WSL and macOS |
 | **OpenCode** | `-s` / `--session` in process args | Plugin state file | SQLite DB query (`~/.local/share/opencode/opencode.db`) | Go binary overwrites process title; DB fallback matches most recent session by cwd |
-| **Codex CLI** | PID lookup in `~/.codex/session-tags.jsonl` | `resume` in process args | - | Codex runs via Node.js, so args are always visible in `ps` |
+| **Codex CLI** | Root rollout file held open by the live PID | PID lookup in `~/.codex/session-tags.jsonl` | `resume` in process args | Uses `/proc/<pid>/fd` on Linux/WSL and `lsof` on macOS; rollout metadata separates the pane root from subagents, and the resolver never guesses from cwd |
 | **Pi** | Session header lookup in `~/.pi/agent/sessions/--<cwd>--/*.jsonl` | `--session` in process args | - | Session-file lookup is cwd-scoped and uses process-time scoring + dedup |
 | **Oh My Pi** | Terminal breadcrumb + session JSONL lookup (`$XDG_STATE_HOME/omp`, `$XDG_DATA_HOME/omp`) | `--resume` / `-r` in process args | `--session-dir` / `--profile` scoped lookup | Distinct `omp` tool; no hook/plugin required |
 | **Grok** | PID lookup in `~/.grok/active_sessions.json` | `-r` / `--resume <uuid>` in process args | - | Registry records every live session (including a bare `grok` with no args) keyed by PID, so sessions sharing a cwd never collide; no hook/plugin required |
@@ -534,9 +534,19 @@ also cleans up its state file on process exit (SIGINT, SIGTERM).
 
 ### Codex CLI
 
-Codex natively writes PID-to-session mappings in
-`~/.codex/session-tags.jsonl`. The save script reads this file directly -- no
-additional hook is needed.
+The save script maps each Codex PID to the writer lock and rollout file that the
+live process already holds open. Both filenames contain the exact session ID.
+It reads `/proc/<pid>/fd` on Linux/WSL and uses the base-system `lsof` on macOS;
+no additional hook is needed.
+
+Some Codex versions also publish PID-to-session mappings in
+`~/.codex/session-tags.jsonl`, and a restored process exposes its ID as
+`codex resume <id>`. Those are exact fallbacks. If the process exposes no exact
+root ID, exposes ambiguous root IDs, or repeats an ID already assigned to
+another pane, the save is skipped. Open subagent rollouts are explicitly
+excluded using their `session_meta` source. The plugin deliberately does not
+guess from cwd, because several Codex panes can legitimately share one
+directory.
 
 ### GitHub Copilot CLI
 
