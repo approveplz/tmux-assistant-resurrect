@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2034  # per-tool variable families accessed via ${!var} dynamic expansion
 # The tmux server may have been started with a limited PATH (e.g. via a
 # systemd user service with a whitelisted runtime environment). That PATH
 # is inherited by every hook this script runs in, so utilities like
@@ -27,6 +28,13 @@ fi
 
 set -euo pipefail
 
+# Sidecars can contain captured environment values and session identifiers.
+# Keep every file this executable creates private, independently of the user's
+# interactive-shell umask. Do not alter the caller's umask when tests source us.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+	umask 077
+fi
+
 # Source shared detection library (detect_tool, pane_has_assistant, posix_quote)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib-detect.sh
@@ -40,14 +48,26 @@ source "$SCRIPT_DIR/lib-detect.sh"
 # hook. Delivering programs via argv sidesteps that failure mode entirely.
 PY_DIR="$SCRIPT_DIR/py"
 
-STATE_DIR="${TMUX_ASSISTANT_RESURRECT_DIR:-${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/tmux-assistant-resurrect}"
+# Shared with the SessionStart/SessionEnd hooks, which write and delete these
+# files from the assistant's process environment rather than the tmux server's.
+STATE_DIR="$(assistant_state_dir)"
+
+# Panes where a tool was detected but neither a session ID nor an authorized
+# relaunch command could be resolved. Such a pane is dropped from the sidecar;
+# without this the save reports plain success and the loss is easy to miss.
+UNRESOLVED_PANES=0
 # Follow tmux-resurrect's own save-dir resolution (see resurrect_data_dir in
 # lib-detect.sh) instead of hardcoding ~/.tmux/resurrect, so our sidecar lands
 # next to resurrect's saves on both legacy and XDG installs.
 RESURRECT_DIR="$(resurrect_data_dir)"
 OUTPUT_FILE="${RESURRECT_DIR}/assistant-sessions.json"
 LOG_FILE="${RESURRECT_DIR}/assistant-save.log"
+LOG_ENABLED=0
 CAPTURE_ENV=$(tmux show-option -gqv @assistant-resurrect-capture-env 2>/dev/null || true)
+RELAUNCH_ENABLED=$(tmux show-option -gqv @assistant-resurrect-relaunch 2>/dev/null || true)
+RELAUNCH_ENABLED="${RELAUNCH_ENABLED:-on}"
+RELAUNCH_LEDGER_FILE="${RESURRECT_DIR}/assistant-relaunch-candidates.json"
+RELAUNCH_LEDGER_TMP=""
 
 # Watchdog deadline (seconds). Defense-in-depth: even without heredoc pipes, a
 # subprocess (python3 on a locked sqlite, a stat on a slow filesystem, a wedged
@@ -61,19 +81,254 @@ case "$SAVE_TIMEOUT" in
 '' | *[!0-9]*) SAVE_TIMEOUT=60 ;;
 esac
 
-mkdir -p -m 0700 "$STATE_DIR"
+# Shared with the SessionStart hook that writes what this reads; see the function.
+ensure_assistant_state_dir "$STATE_DIR"
 mkdir -p "$RESURRECT_DIR"
 
-# Rotate log: keep only the most recent 500 lines to prevent unbounded growth
-# (continuum saves every 5 minutes, so this grows ~12 lines/hour).
-if [ -f "$LOG_FILE" ]; then
-	tail -n 500 "$LOG_FILE" >"${LOG_FILE}.tmp" 2>/dev/null && mv "${LOG_FILE}.tmp" "$LOG_FILE" || true
+# Move an existing log aside without following it, then create the replacement
+# atomically under noclobber and retain its descriptor. Later path replacement
+# cannot redirect writes. The moved file is rechecked before it is read so a
+# raced symlink is never used as rotation input.
+_log_previous=""
+_log_previous_copied=0
+if [ -e "$LOG_FILE" ] || [ -L "$LOG_FILE" ]; then
+	if [ -L "$LOG_FILE" ]; then
+		printf '%s\n' "tmux-assistant-resurrect: refusing symlinked save log: $LOG_FILE" >&2
+	elif [ ! -f "$LOG_FILE" ]; then
+		printf '%s\n' "tmux-assistant-resurrect: refusing non-regular save log: $LOG_FILE" >&2
+	else
+		_log_previous=$(mktemp "${LOG_FILE}.rotate.XXXXXX" 2>/dev/null || true)
+		if [ -z "$_log_previous" ] || ! mv "$LOG_FILE" "$_log_previous" 2>/dev/null; then
+			printf '%s\n' "tmux-assistant-resurrect: cannot rotate save log, disabling file logging: $LOG_FILE" >&2
+			[ -z "$_log_previous" ] || rm -f "$_log_previous"
+			_log_previous=""
+		fi
+	fi
 fi
 
+if { [ ! -e "$LOG_FILE" ] && [ ! -L "$LOG_FILE" ]; } &&
+	{ [ -z "$_log_previous" ] || { [ -f "$_log_previous" ] && [ ! -L "$_log_previous" ]; }; }; then
+	_log_had_noclobber=0
+	case "$-" in *C*) _log_had_noclobber=1 ;; esac
+	_log_old_umask=$(umask)
+	umask 077
+	set -C
+	if exec 9>"$LOG_FILE"; then
+		LOG_ENABLED=1
+	fi
+	[ "$_log_had_noclobber" -eq 1 ] || set +C
+	umask "$_log_old_umask"
+	if [ "$LOG_ENABLED" -eq 1 ] && [ -n "$_log_previous" ]; then
+		if tail -n 500 "$_log_previous" >&9 2>/dev/null; then
+			_log_previous_copied=1
+		fi
+	fi
+fi
+
+if [ -n "$_log_previous" ]; then
+	if [ "$LOG_ENABLED" -eq 1 ] && [ "$_log_previous_copied" -eq 1 ]; then
+		rm -f "$_log_previous"
+	else
+		printf '%s\n' "tmux-assistant-resurrect: previous save log retained at $_log_previous" >&2
+	fi
+fi
+if [ "$LOG_ENABLED" -ne 1 ] && [ ! -e "$LOG_FILE" ]; then
+	printf '%s\n' "tmux-assistant-resurrect: cannot securely open save log, disabling file logging: $LOG_FILE" >&2
+fi
+unset _log_previous _log_previous_copied _log_had_noclobber _log_old_umask
+
 log() {
-	local msg="[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"
-	echo "$msg" >&2
-	echo "$msg" >>"$LOG_FILE"
+	local msg
+	msg="[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"
+	msg="${msg//$'\r'/\\r}"
+	msg="${msg//$'\n'/\\n}"
+	msg="${msg//$'\033'/\\e}"
+	printf '%s\n' "$msg" >&2
+	if [ "$LOG_ENABLED" -eq 1 ]; then
+		if ! printf '%s\n' "$msg" >&9 2>/dev/null; then
+			LOG_ENABLED=0
+			printf '%s\n' "tmux-assistant-resurrect: cannot write save log, disabling file logging: $LOG_FILE" >&2
+		fi
+	fi
+}
+
+# Move state files left in any pre-$HOME default into the current state dir.
+#
+# Upgrades happen under a live tmux server: assistants that were already running
+# fired their SessionStart hook against the old path and will not fire it again.
+# Without this, the first save after upgrade records no session ID for any of
+# them — and continuum overwrites the good sidecar within five minutes, so the
+# IDs are gone before the user notices. Files whose assistants have since exited
+# are harmless; reap_stale_state_files() clears them on the same pass.
+migrate_legacy_state_files() {
+	local rest
+	rest=$(legacy_assistant_state_dirs)
+	[ -n "$rest" ] || return 0
+
+	local moved=0 sources="" legacy f nl=$'\n'
+	# Walk the newline-separated list with parameter expansion. Deliberately not
+	# `read` fed by a here-string: this script must contain no `<<<` at all (issue
+	# #48 -- bash >= 5.1 writes one to a pipe before the reader is exec'd, and that
+	# write can block forever under pipe-KVA pressure on macOS, hanging the hook).
+	# test/run-tests.sh Test 11 greps for the construct and fails the build.
+	while [ -n "$rest" ]; do
+		legacy="${rest%%"$nl"*}"
+		if [ "$legacy" = "$rest" ]; then
+			rest=""
+		else
+			rest="${rest#*"$nl"}"
+		fi
+
+		[ -n "$legacy" ] || continue
+		[ -d "$legacy" ] || continue
+		# /tmp/tmux-assistant-resurrect is world-writable-parent and unscoped by uid:
+		# on a shared box it may be another user's directory, or a symlink planted
+		# where one was expected. Either way it holds nothing of ours to migrate --
+		# our own pre-upgrade hook could not have written into it.
+		[ -L "$legacy" ] && continue
+		[ -O "$legacy" ] || continue
+
+		local moved_here=0 dest
+		for f in "$legacy"/claude-*.json "$legacy"/opencode-*.json; do
+			[ -f "$f" ] || continue
+			[ -O "$f" ] || continue
+
+			dest="$STATE_DIR/$(basename "$f")"
+			# Two files can claim one PID: a leftover whose PID was recycled, or the
+			# same PID seen at two pre-upgrade roots. Neither the destination's mere
+			# existence nor a root's probe position says which is current, so mtime
+			# decides -- the hook writes just after its assistant starts, so the newer
+			# file belongs to whoever holds the PID now. Always preferring $dest can
+			# drop the only good copy and leave reap_stale_state_files() to delete the
+			# stale one it kept. `-nt` is a bash builtin, so this costs no fork.
+			if [ -e "$dest" ] && [ ! "$f" -nt "$dest" ]; then
+				# `|| true` for the same reason as the `mv` below: under `set -e` a
+				# bare `rm -f` that cannot unlink (a legacy root gone read-only) would
+				# abort the save before assistant-sessions.json is written. Leaving the
+				# older duplicate behind costs nothing — the destination already holds
+				# the copy that wins.
+				rm -f "$f" 2>/dev/null || true
+				continue
+			fi
+
+			# `|| true` is load-bearing under `set -e`: a bare mv that fails -- a
+			# read-only state dir, a cross-device legacy root -- would abort the whole
+			# save before assistant-sessions.json is written, turning a skippable file
+			# into total data loss for every pane. Failure here just leaves the file
+			# where it is for the next save to retry.
+			#
+			# Not `mv -n`: the two userlands disagree on what a refusal even is (BSD
+			# exits 0, GNU coreutils exits 1, so under `set -e` a perfectly normal
+			# refusal would kill the hook on Linux), and it cannot express the
+			# replace-the-stale-one case above anyway. The narrow window it would have
+			# guarded -- a SessionStart hook writing $dest between the check and the
+			# rename -- is bounded instead: rename preserves the source's mtime, so
+			# reap_stale_state_files(), which main() runs on the next line, drops a
+			# mis-migrated file on this same pass. The race costs a missing session ID,
+			# never a wrong one.
+			mv -f "$f" "$dest" 2>/dev/null || true
+			[ -e "$f" ] || moved_here=$((moved_here + 1))
+		done
+		# Best-effort: only succeeds once the directory is empty, which is what we want.
+		rmdir "$legacy" 2>/dev/null || true
+
+		if [ "$moved_here" -gt 0 ]; then
+			moved=$((moved + moved_here))
+			sources="$sources $legacy"
+		fi
+	done
+
+	[ "$moved" -gt 0 ] && log "migrated $moved state file(s) from legacy state dir(s):$sources"
+	return 0
+}
+
+# Remove state files whose process is gone.
+#
+# The SessionEnd hook deletes a session's own file, but it never runs on SIGKILL,
+# OOM, a crash, or a closed terminal. Under the old $TMPDIR/$XDG_RUNTIME_DIR
+# default those leftovers were cleared at reboot; $HOME persists, so the save hook
+# sweeps them itself. This bounds growth and, more importantly, shrinks the window
+# in which a recycled PID matches an unrelated assistant's stale file and restores
+# the wrong conversation.
+#
+# The PID comes from the filename (our own hooks write claude-<pid>.json), so the
+# liveness check costs no forks — `kill -0` is a builtin. Files not matching the
+# pattern are left alone rather than deleted, and the numeric guard mirrors
+# `just clean`: without it a corrupt `pid: 0` file would survive forever, because
+# `kill -0 0` signals the caller's own process group and always succeeds.
+reap_stale_state_files() {
+	local reaped=0 f base pid stale
+	for f in "$STATE_DIR"/claude-*.json "$STATE_DIR"/opencode-*.json; do
+		[ -f "$f" ] || continue
+		base=$(basename "$f")
+		pid="${base#*-}"
+		pid="${pid%.json}"
+		stale=0
+		if ! [[ "$pid" =~ ^[0-9]+$ ]] || [ "$pid" -le 1 ]; then
+			stale=1
+		elif ! kill -0 "$pid" 2>/dev/null; then
+			stale=1
+		# The PID is live — but is it still the same process? $HOME survives
+		# reboots, and after a reboot every PID is recycled, so a leftover file
+		# can land on an unrelated assistant and restore a stranger's
+		# conversation into the pane. Same test as the Copilot lock: the hook
+		# writes just after the assistant starts, so a file older than the
+		# process claiming it belongs to a dead predecessor.
+		elif _file_predates_process "$f" "$pid"; then
+			stale=1
+		fi
+		[ "$stale" -eq 1 ] || continue
+
+		# Tested rather than bare, for the same reason the `mv` in
+		# migrate_legacy_state_files() carries `|| true`: this script runs under
+		# `set -e`, and `rm -f` still fails on a file it cannot unlink (an
+		# unwritable $STATE_DIR, an immutable file). A bare one would abort the
+		# save before assistant-sessions.json is written, losing every pane's
+		# session ID over one undeletable leftover. Counting only on success also
+		# keeps the log honest — "reaped 3" must not include files still on disk.
+		if rm -f "$f" 2>/dev/null; then
+			reaped=$((reaped + 1))
+		fi
+	done
+	[ "$reaped" -gt 0 ] && log "reaped $reaped stale state file(s)"
+	return 0
+}
+
+# Explain where the save hook looked when it came up empty.
+#
+# "no session ID available" on its own is indistinguishable between "the hook
+# never ran", "the hook ran but wrote somewhere this process cannot see" (the
+# writer/reader path mismatch of issue #65) and "this assistant genuinely has no
+# ID yet". Naming the path turns that into a one-look diagnosis.
+missing_session_hint() {
+	local tool="$1" pid="$2" state_file=""
+	case "$tool" in
+	claude) state_file="$STATE_DIR/claude-${pid}.json" ;;
+	opencode) state_file="$STATE_DIR/opencode-${pid}.json" ;;
+	*)
+		echo "(no session ID in args)"
+		return
+		;;
+	esac
+
+	if [ -f "$state_file" ]; then
+		echo "(state file $state_file holds no session_id; no session ID in args)"
+		return
+	fi
+
+	# A live assistant in the pane but not one state file anywhere is the
+	# signature of a path mismatch: the hook wrote to a directory this process
+	# resolves differently.
+	local found=""
+	for found in "$STATE_DIR"/*.json; do
+		[ -e "$found" ] && break
+		found=""
+	done
+	if [ -z "$found" ]; then
+		echo "(no $state_file, and no state files at all in $STATE_DIR — is the $tool hook installed, and does it resolve the same state dir? override both sides with TMUX_ASSISTANT_RESURRECT_DIR)"
+	else
+		echo "(no $state_file; no session ID in args)"
+	fi
 }
 
 USED_CODEX_SESSION_IDS=""
@@ -99,12 +354,19 @@ get_claude_session() {
 		fi
 	fi
 
-	# Method 2: --resume flag in process args (chicken-and-egg fallback)
-	# After restore, claude is launched as `claude --resume <session_id>`.
-	# Supports both `--resume <id>` and `--resume=<id>` forms.
+	# Method 2: session selector in process args (chicken-and-egg fallback).
+	# After restore, claude is launched as `claude --resume <session_id>`, and
+	# `claude --session-id <uuid>` names the session up front the same way.
 	# If the SessionStart hook hasn't fired yet, the ID is still in the args.
+	#
+	# _arg_value is the same helper get_omp_session already uses. It handles
+	# both `--flag <id>` and `--flag=<id>`, and it will not mistake a following
+	# option for the value -- the old regex read `claude --resume --model opus`
+	# as the session ID `--model`. Two calls rather than one so --resume keeps
+	# precedence when both flags are present, as it did before.
 	local sid
-	sid=$(echo "$args" | sed -n "s/.*--resume[= ] *\([A-Za-z0-9_-]*\).*/\1/p")
+	sid=$(_arg_value "$args" --resume)
+	[ -n "$sid" ] || sid=$(_arg_value "$args" --session-id)
 	if [ -n "$sid" ]; then
 		echo "$sid"
 		return
@@ -216,20 +478,28 @@ _file_recency_key() {
 		LC_ALL=C stat -f '%Fm|%Fc' "$1" 2>/dev/null
 }
 
+# Is a file that was written at process start older than the process now holding
+# that PID? If so it belongs to a dead predecessor whose PID has been recycled,
+# and trusting it would map the new process onto the dead session. Advisory: when
+# either timestamp is unavailable, report "not stale" rather than lose a real
+# session.
+_file_predates_process() {
+	local file="$1" pid="$2"
+	local file_mtime proc_start
+	file_mtime=$(_file_mtime_epoch "$file")
+	[ -n "$file_mtime" ] || return 1
+	proc_start=$(get_process_start_epoch "$pid")
+	[ -n "$proc_start" ] || return 1
+	# Slack: the macOS start time is derived from second-granular elapsed time.
+	[ "$file_mtime" -lt "$((proc_start - 5))" ]
+}
+
 # A SIGKILLed Copilot leaves its lock behind. If that PID is later recycled by a
 # new Copilot, the stale lock would map the new process onto the dead session.
 # The lock is written at session start, so one older than the process claiming
-# it is stale. Advisory: when either timestamp is unavailable, accept the lock
-# rather than lose a real session.
+# it is stale.
 _copilot_lock_is_live() {
-	local lock="$1" pid="$2"
-	local lock_mtime proc_start
-	lock_mtime=$(_file_mtime_epoch "$lock")
-	[ -n "$lock_mtime" ] || return 0
-	proc_start=$(get_process_start_epoch "$pid")
-	[ -n "$proc_start" ] || return 0
-	# Slack: the macOS start time is derived from second-granular elapsed time.
-	[ "$lock_mtime" -ge "$((proc_start - 5))" ]
+	! _file_predates_process "$1" "$2"
 }
 
 get_copilot_session_from_lock() {
@@ -293,7 +563,7 @@ get_copilot_session() {
 	local uuid='\([0-9a-fA-F]\{8\}-[0-9a-fA-F]\{4\}-[0-9a-fA-F]\{4\}-[0-9a-fA-F]\{4\}-[0-9a-fA-F]\{12\}\)'
 	local flag
 	for flag in '--session-id' '--resume' '-r'; do
-		sid=$(echo "$args" | sed -n "s/.*$flag[= ] *$uuid.*/\1/p")
+		sid=$(echo "$args" | sed -n "s/.*${flag}[= ] *$uuid.*/\1/p")
 		if [ -n "$sid" ]; then
 			# Same resumability gate as the lock path. `copilot --session-id
 			# <uuid>` on a blank TUI puts a UUID in argv long before the session
@@ -511,6 +781,7 @@ _arg_value() {
 	local _had_noglob=0
 	case $- in *f*) _had_noglob=1 ;; esac
 	set -f
+	# shellcheck disable=SC2206  # deliberate word-split of argv string; globbing disabled above
 	words=($args)
 	[ "$_had_noglob" = 1 ] || set +f
 	local i n word flag next
@@ -829,7 +1100,7 @@ get_grok_session() {
 register_codex_session_id() {
 	local sid="$1"
 	[ -z "$sid" ] && return
-	case "${USED_CODEX_SESSION_IDS}"$'\t' in
+	case "$USED_CODEX_SESSION_IDS"$'\t' in
 	*$'\t'"$sid"$'\t'*) ;;
 	*)
 		USED_CODEX_SESSION_IDS="${USED_CODEX_SESSION_IDS}"$'\t'"$sid"
@@ -840,8 +1111,8 @@ register_codex_session_id() {
 register_pi_session_id() {
 	local sid="$1"
 	[ -z "$sid" ] && return
-	case "$USED_PI_SESSION_IDS" in
-	*"$sid"*) ;;
+	case "$USED_PI_SESSION_IDS"$'\t' in
+	*$'\t'"$sid"$'\t'*) ;;
 	*)
 		USED_PI_SESSION_IDS="${USED_PI_SESSION_IDS}"$'\t'"$sid"
 		;;
@@ -851,8 +1122,8 @@ register_pi_session_id() {
 register_omp_session_id() {
 	local sid="$1"
 	[ -z "$sid" ] && return
-	case "$USED_OMP_SESSION_IDS" in
-	*"$sid"*) ;;
+	case "$USED_OMP_SESSION_IDS"$'\t' in
+	*$'\t'"$sid"$'\t'*) ;;
 	*)
 		USED_OMP_SESSION_IDS="${USED_OMP_SESSION_IDS}"$'\t'"$sid"
 		;;
@@ -966,6 +1237,132 @@ _etime_to_seconds() {
 	echo "$((10#$days * 86400 + 10#$hours * 3600 + 10#$mins * 60 + 10#$secs))"
 }
 
+# Merge one advisory relaunch candidate into the user-visible ledger. Process
+# lifetime is only a ranking hint: it never participates in voucher matching or
+# restore authorization. Entries unseen for 30 days are pruned and the 200 most
+# recently observed entries are retained.
+relaunch_ledger_apply() {
+	local tool="$1" canon="$2" pid="$3"
+	local now_epoch now_iso start_epoch lifetime=0 cutoff existing tmp
+	now_epoch=$(date +%s)
+	now_iso=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+	start_epoch=$(get_process_start_epoch "$pid")
+	case "$start_epoch" in
+	'' | *[!0-9]*) ;;
+	*)
+		if [ "$start_epoch" -le "$now_epoch" ]; then
+			lifetime=$((now_epoch - start_epoch))
+		fi
+		;;
+	esac
+	cutoff=$((now_epoch - 30 * 24 * 60 * 60))
+
+	if [ -f "$RELAUNCH_LEDGER_FILE" ]; then
+		existing=$(sed -n '1,$p' "$RELAUNCH_LEDGER_FILE" 2>/dev/null || printf '[]')
+	else
+		existing='[]'
+	fi
+	tmp=$(mktemp "${RELAUNCH_LEDGER_FILE}.tmp.XXXXXX") || return 1
+	RELAUNCH_LEDGER_TMP="$tmp"
+	if ! (umask 077 && jq -Rn \
+		--arg existing "$existing" \
+		--arg tool "$tool" \
+		--arg cmd "$canon" \
+		--arg now_iso "$now_iso" \
+		--argjson now "$now_epoch" \
+		--argjson cutoff "$cutoff" \
+		--argjson lifetime "$lifetime" '
+		($existing | try fromjson catch []) as $decoded |
+		(if ($decoded | type) == "array" then $decoded else [] end) as $entries |
+		($entries | map(select((.last_seen_epoch // 0) >= $cutoff))) as $fresh |
+		($fresh | map(select(.tool == $tool and .cmd == $cmd)) | first // {}) as $prior |
+		($fresh
+		 | map(select(.tool != $tool or .cmd != $cmd))
+		 | . + [{
+			tool: $tool,
+			cmd: $cmd,
+			seen: (($prior.seen // 0) + 1),
+			longest_seconds: ([($prior.longest_seconds // 0), $lifetime] | max),
+			first_seen: ($prior.first_seen // $now_iso),
+			last_seen: $now_iso,
+			last_seen_epoch: $now
+		  }]
+		 | sort_by(.last_seen_epoch) | reverse | .[:200])
+	' >"$tmp"); then
+		rm -f "$tmp"
+		RELAUNCH_LEDGER_TMP=""
+		return 1
+	fi
+	mv -f "$tmp" "$RELAUNCH_LEDGER_FILE"
+	RELAUNCH_LEDGER_TMP=""
+}
+
+# Handle the shared no-session-ID path used by both the batched resolver and
+# legacy emit_session(). Shape only controls whether the command is proposed in
+# the ledger. A hand-written exact voucher can authorize a shape-rejected line;
+# conversely, a shape-ok line is never authorization by itself.
+handle_sessionless_relaunch() {
+	local target="$1" tool="$2" pid="$3" raw_args="$4" cwd="$5"
+	local log_missing="${6:-1}"
+	local prefix
+	prefix="detected $tool in $target (pid $pid) but no session ID available $(missing_session_hint "$tool" "$pid")"
+	local canon="" canon_log="" vouched_line="" shape_ok=0 relaunch_parts
+
+	case "$RELAUNCH_ENABLED" in
+	on | yes | true | 1) ;;
+	*)
+		[ "$log_missing" = "1" ] && log "$prefix: relaunch disabled"
+		return 1
+		;;
+	esac
+
+	canon=$(relaunch_canon "$tool" "$raw_args") || {
+		[ "$log_missing" = "1" ] && log "$prefix: relaunch argv could not be canonicalized"
+		return 1
+	}
+	# Every diagnostic below quotes the canonical command. A pane launched with
+	# an inline key is exactly the case that lands here -- relaunch_shape_ok()
+	# rejects credential flags, so the rejection message would otherwise be the
+	# one place the key is written to assistant-save.log verbatim. Log the
+	# stripped form; $canon itself stays intact for the shape and ledger checks,
+	# which must see the real argv.
+	canon_log=$(strip_credential_flags "$canon" "$tool relaunch cmd")
+
+	if relaunch_shape_ok "$canon"; then
+		shape_ok=1
+		if ! relaunch_ledger_apply "$tool" "$canon" "$pid"; then
+			log "warning: failed to update relaunch candidates ledger for $canon_log"
+		fi
+	fi
+
+	vouched_line=$(relaunch_voucher_match "$tool" "$canon") || {
+		if [ "$log_missing" = "1" ]; then
+			if [ "$shape_ok" -eq 1 ]; then
+				log "$prefix: relaunch cmd not vouched: $canon_log"
+			else
+				log "$prefix: relaunch shape rejected: $canon_log"
+			fi
+		fi
+		return 1
+	}
+
+	relaunch_parts="${RELAUNCH_PARTS_FILE:-}"
+	if [ -z "$relaunch_parts" ] && [ -n "${PARTS_FILE:-}" ]; then
+		relaunch_parts="${PARTS_FILE}.relaunch"
+		RELAUNCH_PARTS_FILE="$relaunch_parts"
+	fi
+	if [ -z "$relaunch_parts" ]; then
+		log "warning: no relaunch parts file available for $canon_log"
+		return 1
+	fi
+
+	# Five fields by design: keep the established session TSV schema untouched.
+	printf '%s\t%s\t%s\t%s\t%s\n' \
+		"$target" "$tool" "$cwd" "$pid" "$vouched_line" >>"$relaunch_parts"
+	[ "$log_missing" = "1" ] && log "$prefix: relaunch vouched: $vouched_line"
+	return 0
+}
+
 # Read user-configured variables directly from a detected assistant process.
 # Claude and OpenCode normally provide these through their session hooks, but
 # tools without hooks (including Codex) need save-time process inspection.
@@ -1035,7 +1432,6 @@ merge_process_env() {
 
 # Copilot's variadic options -- the ones whose --help spelling ends in `...`,
 # e.g. `--allow-tool[=tools...]`. They legitimately occupy several argv tokens.
-SESSION_EXTRA_WARM_copilot=_copilot_variadic_flags
 SESSION_VARIADIC_FALLBACK_copilot="--allow-tool --allow-url --available-tools --deny-tool --deny-url --excluded-tools --secret-env-vars"
 
 _copilot_variadic_flags() {
@@ -1283,6 +1679,7 @@ _strip_bool_opt() {
 # tokens (e.g. option values like "o3" in `--model o3 resume`) are
 # skipped — scanning continues past them to find the actual subcommand.
 _strip_subcmds() {
+	# shellcheck disable=SC2206  # deliberate word-split of argv string
 	local -a words=($1)
 	shift
 	local -a targets=("$@")
@@ -1322,6 +1719,7 @@ HELP_PROBE_ENV_copilot="COPILOT_AUTO_UPDATE=false"
 
 # Cached per tool in _TOOL_HELP_<tool>: several discovery passes read the same
 # help text, and the callers run in a $() subshell per pane.
+# shellcheck disable=SC2178,SC2128  # out is a plain string; printf -v writes to a dynamic name
 _tool_help() {
 	local tool="$1"
 	local cache_var="_TOOL_HELP_${tool}"
@@ -1343,6 +1741,139 @@ _tool_help() {
 
 	printf -v "$cache_var" '%s' "${out:--}"
 	[ -n "$out" ] && printf '%s\n' "$out"
+	return 0
+}
+
+# Static value-taking option fallbacks for when a running assistant is not on
+# the save hook's PATH. Dynamic discovery below is authoritative when --help is
+# available; these keep common replay settings intact in the degraded path.
+OPTION_VALUE_FLAGS_FALLBACK_claude="--add-dir --agent --agents --allowedTools --allowed-tools --append-system-prompt --autocompact --betas --cloud -d --debug --debug-file --disallowedTools --disallowed-tools --effort --environment --fallback-model --file --input-format --json-schema --max-budget-usd --mcp-config --model -n --name --output-format --permission-mode --plugin-dir --plugin-url --prompt-suggestions --remote-control --remote-control-session-name-prefix --setting-sources --settings --system-prompt --teleport --tools -w --worktree"
+OPTION_VALUE_FLAGS_FALLBACK_copilot="--add-dir --add-github-mcp-tool --add-github-mcp-toolset --additional-mcp-config --agent --allow-tool --allow-url --attachment --available-tools --bash-env -C --context --deny-tool --deny-url --disable-mcp-server --effort --reasoning-effort --excluded-tools --extension-sdk-path --log-dir --log-level --max-ai-credits --max-autopilot-continues --mode --model --mouse --output-format --plugin-dir --secret-env-vars --share --stream"
+OPTION_VALUE_FLAGS_FALLBACK_opencode="--log-level --port --hostname --mdns-domain --cors -m --model --prompt --agent --replay-limit"
+OPTION_VALUE_FLAGS_FALLBACK_codex="-c --config --enable --disable --remote --remote-auth-token-env -i --image -m --model --local-provider -p --profile -s --sandbox -C --cd --add-dir -a --ask-for-approval"
+OPTION_VALUE_FLAGS_FALLBACK_pi="--provider --model --api-key --system-prompt --append-system-prompt --mode -n --name --models -t --tools -xt --exclude-tools --thinking -e --extension --skill --prompt-template --theme --use-theme --export --list-models --tui-mode"
+OPTION_VALUE_FLAGS_FALLBACK_omp="--model --smol --slow --plan --prewalk-into --plan-yolo-into --provider --api-key --system-prompt --append-system-prompt --profile --alias --cwd --mode --config --session-dir --models --tools --thinking --hook -e --extension --skills --export --max-time --approval-mode --plugin-dir"
+OPTION_VALUE_FLAGS_FALLBACK_grok="--model --effort --cwd"
+
+# Discover options that accept a separate value from the top-level --help.
+# Commander/clap-style help marks values as <...> or [...]; yargs-style help
+# uses type annotations such as [string], [number], or [array], sometimes on a
+# continuation line. Emit both long and short spellings so the argv filter can
+# distinguish an option value from a positional prompt.
+_discover_option_value_flags() {
+	local tool="$1"
+	local cache_var="_OPTION_VALUE_FLAGS_${tool}"
+	local cached="${!cache_var:-}"
+	if [ -n "$cached" ]; then
+		[ "$cached" = "-" ] || echo "$cached"
+		return 0
+	fi
+
+	local fallback_var="OPTION_VALUE_FLAGS_FALLBACK_${tool}"
+	local fallback="${!fallback_var:-}"
+	local help_out result=""
+	help_out=$(_tool_help "$tool") || true
+	if [ -n "$help_out" ]; then
+		result=$(printf '%s\n' "$help_out" | awk '
+			function flush() {
+				if (head == "") return
+				decl = head
+				sub(/^[[:space:]]+/, "", decl)
+				sub(/[[:space:]][[:space:]].*$/, "", decl)
+				if (decl ~ /<[^>]+>/ ||
+				    (decl ~ /\[[^]]+\]/ && decl !~ /\[boolean\]/) ||
+				    entry ~ /\[(string|number|array)\]/) {
+					print decl
+				}
+				head = ""
+				entry = ""
+			}
+			/^[[:space:]]+(-[A-Za-z][A-Za-z0-9-]*[[:space:],]|--[A-Za-z][A-Za-z0-9-]*)/ {
+				flush()
+				head = $0
+				entry = $0
+				next
+			}
+			{ if (head != "") entry = entry "\n" $0 }
+			END { flush() }
+		' | grep -oE -- '--[A-Za-z][A-Za-z0-9-]*|(^|[[:space:],])-[A-Za-z][A-Za-z0-9-]*' |
+			sed -E 's/^[[:space:],]+//') || true
+	fi
+
+	# Help output can be partial (and some supported options are hidden), so
+	# supplement discovery with the pinned safe fallback just as session-flag
+	# discovery does.
+	result=$(printf '%s\n%s\n' "$result" "$fallback" | tr ' ' '\n' | sed '/^$/d' | sort -u | tr '\n' ' ')
+	result="${result% }"
+	printf -v "$cache_var" '%s' "${result:--}"
+	[ -n "$result" ] && echo "$result"
+	return 0
+}
+
+# Remove positional argv while retaining values belonging to known options.
+# Once the first positional is seen, discard it and the entire remaining tail:
+# a prompt can contain flag-looking words that must never become replayed flags.
+_drop_positional_args() {
+	local tool="$1" args="$2"
+	# Bash 3.2 treats an empty array expansion as an unbound variable under
+	# nounset.  Avoid constructing/iterating that array when there is no argv.
+	case "$args" in
+	*[![:space:]]*) ;;
+	*) return 0 ;;
+	esac
+	local value_flags
+	value_flags=" $(_discover_option_value_flags "$tool") "
+	local variadic_flags=""
+	[ "$tool" = "copilot" ] && variadic_flags=" $(_copilot_variadic_flags) "
+
+	# Word-split with pathname expansion disabled: argv is data, so values such
+	# as '*' must never expand against the save hook's working directory.
+	local reglob=""
+	case "$-" in
+	*f*) ;;
+	*) reglob=1 ;;
+	esac
+	set -f
+	# shellcheck disable=SC2206  # deliberate word-split of flattened argv
+	local -a words=($args)
+	[ -n "$reglob" ] && set +f
+
+	local -a out=()
+	local word flag="" expects_value=0 variadic=0
+	for word in "${words[@]}"; do
+		case "$word" in
+		-*)
+			out[${#out[@]}]="$word"
+			flag="${word%%=*}"
+			expects_value=0
+			variadic=0
+			case "$word" in
+			*=*) ;;
+			*)
+				case "$value_flags" in
+				*" $flag "*) expects_value=1 ;;
+				esac
+				case "$variadic_flags" in
+				*" $flag "*) variadic=1 ;;
+				esac
+				;;
+			esac
+			;;
+		*)
+			if [ "$expects_value" -eq 1 ]; then
+				out[${#out[@]}]="$word"
+				if [ "$variadic" -eq 0 ]; then
+					expects_value=0
+					flag=""
+				fi
+			else
+				break
+			fi
+			;;
+		esac
+	done
+
+	[ "${#out[@]}" -gt 0 ] && echo "${out[*]}"
 	return 0
 }
 
@@ -1464,6 +1995,24 @@ SESSION_FLAGS_FALLBACK_grok="--continue -c
 --resume -r
 --session-id -s"
 
+# Every helper that parses --help must be warmed in main's shell so its cache
+# survives the per-pane extract_cli_args command substitutions. The Copilot
+# wrapper also retains the existing variadic-option discovery warmup.
+_warm_cli_arg_helpers() {
+	local tool="$1"
+	_discover_option_value_flags "$tool" >/dev/null
+	[ "$tool" = "copilot" ] && _copilot_variadic_flags >/dev/null
+	return 0
+}
+
+SESSION_EXTRA_WARM_claude=_warm_cli_arg_helpers
+SESSION_EXTRA_WARM_copilot=_warm_cli_arg_helpers
+SESSION_EXTRA_WARM_opencode=_warm_cli_arg_helpers
+SESSION_EXTRA_WARM_codex=_warm_cli_arg_helpers
+SESSION_EXTRA_WARM_pi=_warm_cli_arg_helpers
+SESSION_EXTRA_WARM_omp=_warm_cli_arg_helpers
+SESSION_EXTRA_WARM_grok=_warm_cli_arg_helpers
+
 # Pre-warm session-identity discovery once per tool present in a tab-separated
 # MATCHES blob (tool name in field 2). extract_cli_args runs in a $() subshell
 # per pane and the discovery helpers cache into a shell var that does not
@@ -1498,7 +2047,7 @@ _warm_session_discovery() {
 		# Per-tool extras that also parse --help and cache into a shell var.
 		extra_warm="SESSION_EXTRA_WARM_${tool}"
 		if [ -n "${!extra_warm:-}" ]; then
-			"${!extra_warm}" >/dev/null
+			"${!extra_warm}" "$tool" >/dev/null
 		fi
 	done < <(printf '%s\n' "$matches" | cut -f2 | sort -u)
 	return 0
@@ -1510,7 +2059,8 @@ _warm_session_discovery() {
 # name/path and tool-specific session/resume arguments.
 #
 # Usage: extract_cli_args <tool> <full_args_from_ps>
-# Returns: the remaining flags/args as a single whitespace-normalized string.
+# Returns: replayable options and their recognized values as a single
+# whitespace-normalized string. Positional arguments are omitted.
 #
 # Session-identity flags are discovered dynamically from <tool> --help,
 # matched by name pattern. This keeps stripping in sync with the installed
@@ -1646,6 +2196,19 @@ extract_cli_args() {
 		fi
 	fi
 
+	# Strip credential-bearing flags so plaintext keys are never persisted to the
+	# sidecar JSON. Shared with the restore path via lib-detect.sh so the two
+	# cannot drift. A user who launched with an inline key will restore without
+	# it; the flag name (never its value) is logged so the difference is visible.
+	args=$(strip_credential_flags "$args" "$tool cli_args")
+
+	# A remaining positional is an initial prompt (or, for OpenCode, a project
+	# path already represented by pane cwd). Never replay it into a resumed
+	# conversation. Preserve recognized separate option values such as
+	# `--model sonnet`; a boolean option followed by a prompt is not mistaken for
+	# a value because option arity comes from --help rather than adjacency.
+	args=$(_drop_positional_args "$tool" "$args")
+
 	# Normalize whitespace: collapse multiple spaces, trim leading/trailing
 	echo "$args" | sed -E 's/  +/ /g; s/^ //; s/ $//'
 }
@@ -1665,15 +2228,24 @@ resolve_pane_candidates() {
 	local has_assoc_cache="$6"
 	local state_cache_file="$7"
 	local parts_file="$8"
+	# The parts pane_target is composed from. Saved separately so restore never
+	# has to parse a target whose session name may itself contain ':' or '.'.
+	local pane_session="${9:-}"
+	local pane_window="${10:-}"
+	local pane_pane_index="${11:-}"
 
-	local resolved=0 first_tool="" first_pid=""
+	local resolved=0 first_tool="" first_pid="" first_args=""
 	for pass in 1 2; do
 		[ "$resolved" -eq 1 ] && break
 		local allow_deferred_fallback=0
 		[ "$pass" -eq 2 ] && allow_deferred_fallback=1
 		while IFS="$us" read -r cand_tool cand_pid cand_args; do
 			[ -z "$cand_tool" ] && continue
-			[ -z "$first_tool" ] && first_tool="$cand_tool" && first_pid="$cand_pid"
+			if [ -z "$first_tool" ]; then
+				first_tool="$cand_tool"
+				first_pid="$cand_pid"
+				first_args="$cand_args"
+			fi
 
 			# Pass 2 is only for fallbacks that can misidentify a live session:
 			# OpenCode's cwd-scoped DB and Copilot's possibly stale loader argv.
@@ -1749,8 +2321,10 @@ resolve_pane_candidates() {
 				fi
 
 				# Write TSV for batch JSON conversion (replaces per-entry jq -n).
-				printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-					"$pane_target" "$cand_tool" "$session_id" "$pane_cwd" "$cand_pid" "$model" "$cli_args" "$env_json" "$copilot_home" >>"$parts_file"
+				# New columns are appended so the existing indices stay put.
+				printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+					"$pane_target" "$cand_tool" "$session_id" "$pane_cwd" "$cand_pid" "$model" "$cli_args" "$env_json" "$copilot_home" \
+					"$pane_session" "$pane_window" "$pane_pane_index" >>"$parts_file"
 
 				case "$cand_tool" in
 				codex) register_codex_session_id "$session_id" ;;
@@ -1764,7 +2338,9 @@ resolve_pane_candidates() {
 	done
 
 	if [ "$resolved" -eq 0 ] && [ -n "$first_tool" ]; then
-		log "detected $first_tool in $pane_target (pid $first_pid) but no session ID available"
+		if ! handle_sessionless_relaunch "$pane_target" "$first_tool" "$first_pid" "$first_args" "$pane_cwd" 1; then
+			UNRESOLVED_PANES=$((UNRESOLVED_PANES + 1))
+		fi
 	fi
 }
 
@@ -1808,6 +2384,7 @@ signal_pids() {
 
 # Space-separated descendants of $root, excluding $root itself and $skip (the
 # watchdog's own PID).
+# shellcheck disable=SC2178,SC2128  # out is a plain string, not an array
 victim_pids() {
 	local root="$1" skip="$2" pid out=""
 	for pid in $(descendant_pids "$root"); do
@@ -1822,7 +2399,7 @@ victim_pids() {
 # tested one-shot utility; save_watchdog uses the snapshot-based logic below.
 reap_descendants() {
 	local root="$1" skip="$2" sig="$3"
-	# shellcheck disable=SC2086
+	# shellcheck disable=SC2086,SC2046  # deliberate word-split of PID list
 	signal_pids "$sig" $(victim_pids "$root" "$skip")
 }
 
@@ -1901,18 +2478,24 @@ stop_save_watchdog() {
 # --- Main ---
 
 main() {
+	# Reset per-run: the script is sourceable, so main() can be entered more
+	# than once in one shell and a stale count would carry over.
+	UNRESOLVED_PANES=0
 	PS_FILE=$(mktemp)
 	PANE_FILE=$(mktemp)
 	PARTS_FILE=$(mktemp)
+	RELAUNCH_PARTS_FILE=$(mktemp)
 	STATE_CACHE_FILE=$(mktemp)
 	WATCHDOG_PID=""
 	WATCHDOG_SELF_FILE=""
 	WATCHDOG_FIRED_FILE=""
+	SESSIONS_TMP=""
+	OUTPUT_TMP=""
 	# stop_save_watchdog MUST run before the rm: it reads WATCHDOG_FIRED_FILE to
 	# decide whether the watchdog has already fired (and so must not be cancelled).
 	# Deleting that file first would make the fired-check always fail, cancelling a
 	# mid-escalation watchdog and defeating the whole grandchild-leak guarantee.
-	trap 'stop_save_watchdog; rm -f "$PS_FILE" "$PANE_FILE" "$PARTS_FILE" "$STATE_CACHE_FILE" "${WATCHDOG_SELF_FILE:-}" "${WATCHDOG_FIRED_FILE:-}" "${OUTPUT_FILE}.tmp.$$"' EXIT INT TERM
+	trap 'stop_save_watchdog; rm -f "$PS_FILE" "$PANE_FILE" "$PARTS_FILE" "$RELAUNCH_PARTS_FILE" "$STATE_CACHE_FILE" "${WATCHDOG_SELF_FILE:-}" "${WATCHDOG_FIRED_FILE:-}" "${RELAUNCH_LEDGER_TMP:-}" "${SESSIONS_TMP:-}" "${OUTPUT_TMP:-}"' EXIT INT TERM
 
 	# Arm the watchdog (unless disabled with a 0/invalid timeout).
 	if [ "$SAVE_TIMEOUT" -gt 0 ]; then
@@ -1938,110 +2521,58 @@ main() {
 	ps -eo pid=,ppid=,args= >"$PS_FILE" 2>/dev/null
 	if [ ! -s "$PS_FILE" ]; then
 		log "ps snapshot failed or empty, skipping save"
-		rm -f "$PS_FILE" "$PANE_FILE" "$PARTS_FILE"
+		rm -f "$PS_FILE" "$PANE_FILE" "$PARTS_FILE" "$RELAUNCH_PARTS_FILE"
 		return 1
 	fi
-	tmux list-panes -a -F "#{session_name}:#{window_index}.#{pane_index}|#{pane_pid}|#{pane_current_path}|#{pane_tty}" >"$PANE_FILE"
+	# Two tagged records per pane, both ending in the one field that may itself
+	# contain the '|' delimiter (the session name / the pane path). Everything
+	# before it is '|'-free — a pane id, a pid, numeric indices, a /dev/... tty —
+	# so awk can peel those off the front by position and take the rest verbatim.
+	# Emitting the two free-form fields on separate records is what keeps them
+	# from shifting each other.
+	#
+	# A control-character delimiter would be simpler but is not portable: tmux
+	# < 3.7 rewrites those in -F output, and differently per version (3.4 emits
+	# the octal escape, 3.5 the hex escape, 3.6 an underscore).
+	#
+	# The records join on #{pane_id}, not #{pane_pid}: it is '%' plus digits (so
+	# still delimiter-free), and tmux never reuses one within a server, whereas
+	# the kernel can hand a dead pane's pid to a new one between the two calls
+	# and silently pair one pane's metadata with another's cwd.
+	#
+	# The calls are a moment apart either way. A pane that dies in between has a
+	# P record but no C record, so it saves with an empty cwd; one created in
+	# between has a C record but no P record, so it is not saved at all. Both are
+	# bounded and self-correcting on the next save — restore skips the `cd` in
+	# the first case, and the pane had no assistant to save in the second.
+	{
+		tmux list-panes -a -F "P|#{pane_id}|#{pane_pid}|#{window_index}|#{pane_index}|#{pane_tty}|#{session_name}"
+		tmux list-panes -a -F "C|#{pane_id}|#{pane_current_path}"
+	} >"$PANE_FILE"
 
 	# --- Single awk pass: detect assistant tools across ALL pane process trees ---
 	# Replaces ~200 separate echo|awk pipe invocations with one pass.
 	# Reads pane list + ps snapshot, builds process tree in memory,
 	# BFS-walks descendants for each pane PID, detects tools.
-	# Output (tab-delimited): target\ttool\ttool_pid\ttool_args\tcwd\tpane_tty
+	# Output (tab-delimited):
+	#   target\ttool\ttool_pid\ttool_args\tcwd\tpane_tty\tsession\twindow\tindex
+	# The session/window/index columns are appended rather than inserted so that
+	# `cut -f2` in _warm_session_discovery() still selects the tool.
 	# NOTE: emit all candidates per pane (pane PID + descendants) in BFS order.
 	# The shell pass below preserves legacy two-pass OpenCode behavior:
 	# 1) PID-specific only, then 2) DB fallback.
 	local MATCHES
-	MATCHES=$(awk '
-		NR == FNR {
-			# First file: pane data (pipe-delimited)
-			split($0, p, "|")
-			pane_target[p[2]] = p[1]
-			pane_cwd[p[2]] = p[3]
-			pane_tty[p[2]] = p[4]
-			pane_list[++pane_count] = p[2]
-			next
-		}
-		{
-			# Second file: ps output (whitespace-delimited)
-			pid = $1+0; ppid = $2+0
-			line = $0
-			sub(/^[ \t]*[0-9]+[ \t]+[0-9]+[ \t]*/, "", line)
-			gsub(/\n/, " ", line)  # Normalize multi-line args (Linux prctl)
-
-			proc_args[pid] = line
-			# First child concatenation produces "" SUBSEP pid; the k > 0 guard
-			# in the BFS loop below filters the resulting empty first element.
-			child_list[ppid] = (ppid in child_list) ? child_list[ppid] SUBSEP pid : "" pid
-
-			# Detect the executable token, optionally after a common script
-			# interpreter. Do not classify recorder wrappers merely because a
-			# later argument names the assistant they will launch.
-			# Keep patterns aligned with detect_tool() in lib-detect.sh:
-			nwords = split(line, words, /[ \t]+/)
-			executable = words[1]
-			sub(/^.*\//, "", executable)
-			arg_start = 2
-			if (executable ~ /^(node|nodejs|bun|bash|sh|zsh)$/ && nwords >= 2) {
-				executable = words[2]
-				sub(/^.*\//, "", executable)
-				arg_start = 3
-			}
-			tool_args = ""
-			for (word_index = arg_start; word_index <= nwords; word_index++) {
-				tool_args = tool_args (tool_args == "" ? "" : " ") words[word_index]
-			}
-
-			if      (executable == "claude")                                                    proc_tool[pid] = "claude"
-			else if (executable == "copilot")                                                  proc_tool[pid] = "copilot"
-			else if (executable == "opencode" && tool_args !~ /^run( |$)/)                     proc_tool[pid] = "opencode"
-			else if ((executable == "codex" || executable ~ /^codex-[^-]+-[^-]+-.+/) &&
-			         tool_args !~ /^app-server( |$)/)                                           proc_tool[pid] = "codex"
-			else if (executable == "pi")                                                        proc_tool[pid] = "pi"
-			else if (executable == "omp" && tool_args !~ /(^| )__omp_worker_/)                 proc_tool[pid] = "omp"
-			else if (executable == "grok")                                                      proc_tool[pid] = "grok"
-		}
-		END {
-			for (i = 1; i <= pane_count; i++) {
-				root = pane_list[i]+0
-				target = pane_target[pane_list[i]]
-				cwd = pane_cwd[pane_list[i]]
-				tty = pane_tty[pane_list[i]]
-
-				# Check pane PID itself (handles exec-replaced shells)
-				if (root in proc_tool && proc_tool[root] != "") {
-					printf "%s\t%s\t%d\t%s\t%s\t%s\n", target, proc_tool[root], root, proc_args[root], cwd, tty
-				}
-
-				# BFS through descendant processes
-				delete queue
-				qs = 1; qe = 0
-				if (root in child_list) {
-					nc = split(child_list[root], kids, SUBSEP)
-					for (j = 1; j <= nc; j++) {
-						k = kids[j]+0
-						if (k > 0) { queue[++qe] = k }
-					}
-				}
-
-				while (qs <= qe) {
-					cur = queue[qs++]+0
-					if (cur in proc_tool && proc_tool[cur] != "") {
-						printf "%s\t%s\t%d\t%s\t%s\t%s\n", target, proc_tool[cur], cur, proc_args[cur], cwd, tty
-					}
-					if (cur in child_list) {
-						nc = split(child_list[cur], kids, SUBSEP)
-						for (j = 1; j <= nc; j++) {
-							k = kids[j]+0
-							if (k > 0) { queue[++qe] = k }
-						}
-					}
-				}
-			}
-		}
-	' "$PANE_FILE" "$PS_FILE")
+	MATCHES=$(awk \
+		-f "$SCRIPT_DIR/lib-detect.awk" \
+		-f "$SCRIPT_DIR/save-assistant-sessions.awk" \
+		"$PANE_FILE" "$PS_FILE")
 
 	rm -f "$PS_FILE" "$PANE_FILE"
+
+	# Both must run before the cache glob below and before any get_*_session call,
+	# so the pass sees the migrated files and not the reaped ones.
+	migrate_legacy_state_files
+	reap_stale_state_files
 
 	# --- Pre-cache all state files in one jq call (requires jq 1.7+) ---
 	# Replaces ~58 per-file jq invocations with one jq + bash associative array.
@@ -2099,18 +2630,22 @@ main() {
 	# Process only matched panes (those with a detected tool)
 	if [ -n "$MATCHES" ]; then
 		local current_target="" current_cwd="" current_tty="" pane_candidates=""
-		while IFS=$'\t' read -r target tool cpid cargs cwd tty; do
+		local current_sess="" current_win="" current_idx=""
+		while IFS=$'\t' read -r target tool cpid cargs cwd tty sess win idx; do
 			[ -z "$target" ] && continue
 
 			# If pane changed, process the previous pane's candidate list.
 			if [ -n "$current_target" ] && [ "$target" != "$current_target" ]; then
-				resolve_pane_candidates "$current_target" "$current_cwd" "$current_tty" "$pane_candidates" "$US" "$HAS_ASSOC_CACHE" "$STATE_CACHE_FILE" "$PARTS_FILE"
+				resolve_pane_candidates "$current_target" "$current_cwd" "$current_tty" "$pane_candidates" "$US" "$HAS_ASSOC_CACHE" "$STATE_CACHE_FILE" "$PARTS_FILE" "$current_sess" "$current_win" "$current_idx"
 				pane_candidates=""
 			fi
 
 			current_target="$target"
 			current_cwd="$cwd"
 			current_tty="$tty"
+			current_sess="$sess"
+			current_win="$win"
+			current_idx="$idx"
 			# Candidate tuples are US-delimited; a literal \x1f inside process args
 			# would break parsing, but this is practically unlikely for CLI argv.
 			pane_candidates="${pane_candidates}${tool}${US}${cpid}${US}${cargs}"$'\n'
@@ -2118,50 +2653,57 @@ main() {
 
 		# Process final pane candidate list.
 		if [ -n "$current_target" ] && [ -n "$pane_candidates" ]; then
-			resolve_pane_candidates "$current_target" "$current_cwd" "$current_tty" "$pane_candidates" "$US" "$HAS_ASSOC_CACHE" "$STATE_CACHE_FILE" "$PARTS_FILE"
+			resolve_pane_candidates "$current_target" "$current_cwd" "$current_tty" "$pane_candidates" "$US" "$HAS_ASSOC_CACHE" "$STATE_CACHE_FILE" "$PARTS_FILE" "$current_sess" "$current_win" "$current_idx"
 		fi
 	fi
 
-	# Single jq: convert TSV to JSON array + build final output (replaces N+3 jq calls).
+	# Keep the established session TSV untouched, then convert the separate
+	# five-field relaunch TSV and attach it as an optional sibling key. Older
+	# restore scripts read only .sessions and safely ignore .relaunch.
 	# Write to a temp file and rename into place so a failed or watchdog-killed jq
 	# leaves the previous valid sidecar intact (a bare `>"$OUTPUT_FILE"` truncates
 	# it before jq runs, which would lose all saved sessions on a timeout).
-	local count=0
-	local OUTPUT_TMP="${OUTPUT_FILE}.tmp.$$"
-	if [ -s "$PARTS_FILE" ]; then
-		if jq -Rs --arg ts "$SAVE_TS" '
+	local count=0 relaunch_count=0
+	SESSIONS_TMP=$(mktemp "${OUTPUT_FILE}.sessions.tmp.XXXXXX")
+	OUTPUT_TMP=$(mktemp "${OUTPUT_FILE}.tmp.XXXXXX")
+	if ! jq -Rs --arg ts "$SAVE_TS" '
 			split("\n") | map(select(length > 0) | split("\t") |
 			{pane:.[0], tool:.[1], session_id:.[2], cwd:.[3], pid:.[4], model:.[5], cli_args:.[6],
-			 env:(.[7] // "null" | try fromjson catch null), copilot_home:(.[8] // "")})
+			 env:(.[7] // "null" | try fromjson catch null), copilot_home:(.[8] // ""),
+			 session_name:(.[9] // ""), window_index:(.[10] // ""), pane_index:(.[11] // "")})
 			| {timestamp: $ts, sessions: .}
-		' "$PARTS_FILE" >"$OUTPUT_TMP"; then
-			mv -f "$OUTPUT_TMP" "$OUTPUT_FILE"
-			count=$(jq '.sessions | length' "$OUTPUT_FILE")
-		else
-			rm -f "$OUTPUT_TMP"
-			log "warning: failed to serialize sessions; keeping previous $OUTPUT_FILE"
-			return 1
-		fi
-	else
-		if jq -n --arg ts "$SAVE_TS" '{timestamp: $ts, sessions: []}' >"$OUTPUT_TMP"; then
-			mv -f "$OUTPUT_TMP" "$OUTPUT_FILE"
-		else
-			# Symmetric with the non-empty branch: if we cannot even write the
-			# empty sidecar (e.g. disk full), do not claim "saved 0" and silently
-			# leave a stale, possibly non-empty sidecar that would later restore
-			# sessions that are no longer running. Surface the failure instead.
-			rm -f "$OUTPUT_TMP"
-			log "warning: failed to write empty sidecar; keeping previous $OUTPUT_FILE"
-			return 1
-		fi
+		' "$PARTS_FILE" >"$SESSIONS_TMP"; then
+		rm -f "$SESSIONS_TMP" "$OUTPUT_TMP"
+		log "warning: failed to serialize sessions; keeping previous $OUTPUT_FILE"
+		return 1
 	fi
+	if ! jq -Rs --slurpfile envelope "$SESSIONS_TMP" '
+		split("\n") | map(select(length > 0) | split("\t") |
+		{pane:.[0], tool:.[1], cwd:.[2], pid:.[3], cmd:.[4]}) as $relaunch |
+		$envelope[0] + {relaunch: $relaunch}
+	' "$RELAUNCH_PARTS_FILE" >"$OUTPUT_TMP"; then
+		rm -f "$SESSIONS_TMP" "$OUTPUT_TMP"
+		log "warning: failed to serialize relaunch entries; keeping previous $OUTPUT_FILE"
+		return 1
+	fi
+	rm -f "$SESSIONS_TMP"
+	mv -f "$OUTPUT_TMP" "$OUTPUT_FILE"
+	SESSIONS_TMP=""
+	OUTPUT_TMP=""
+	count=$(jq '.sessions | length' "$OUTPUT_FILE")
+	relaunch_count=$(jq '.relaunch | length' "$OUTPUT_FILE")
 
-	log "saved $count assistant session(s) to $OUTPUT_FILE"
+	if [ "$UNRESOLVED_PANES" -gt 0 ]; then
+		log "saved $count assistant session(s) to $OUTPUT_FILE ($UNRESOLVED_PANES detected but unresolved)"
+	else
+		log "saved $count assistant session(s) to $OUTPUT_FILE"
+	fi
+	[ "$relaunch_count" -gt 0 ] && log "saved $relaunch_count vouched assistant relaunch command(s)"
 
 	# Strip captured pane contents for assistant panes so tmux-resurrect
 	# won't restore stale TUI output that the post-restore hook would
 	# immediately replace. Non-assistant pane contents are preserved.
-	if [ "$count" -gt 0 ]; then
+	if [ $((count + relaunch_count)) -gt 0 ]; then
 		strip_assistant_pane_contents
 	fi
 }
@@ -2178,9 +2720,9 @@ strip_assistant_pane_contents() {
 	local archive="$RESURRECT_DIR/pane_contents.tar.gz"
 	[ -f "$archive" ] || return 0
 
-	# Collect pane targets from the sessions we just saved
+	# Collect pane targets from saved sessions and vouched relaunches.
 	local panes
-	panes=$(jq -r '.sessions[].pane' "$OUTPUT_FILE" 2>/dev/null) || return 0
+	panes=$(jq -r '(.sessions // [])[]?.pane, (.relaunch // [])[]?.pane' "$OUTPUT_FILE" 2>/dev/null) || return 0
 	[ -z "$panes" ] && return 0
 
 	local tmpdir
@@ -2204,12 +2746,14 @@ strip_assistant_pane_contents() {
 	done < <(printf '%s\n' "$panes")
 
 	if [ "$removed" -gt 0 ]; then
-		if tar cf - -C "$tmpdir" ./pane_contents/ | gzip >"${archive}.tmp" 2>/dev/null; then
-			mv "${archive}.tmp" "$archive"
+		local archive_tmp
+		archive_tmp=$(mktemp "${archive}.tmp.XXXXXX") || archive_tmp=""
+		if [ -n "$archive_tmp" ] && tar cf - -C "$tmpdir" ./pane_contents/ | gzip >"$archive_tmp" 2>/dev/null; then
+			mv "$archive_tmp" "$archive"
 			log "stripped pane contents for $removed assistant pane(s)"
 		else
 			log "warning: failed to repack pane_contents archive"
-			rm -f "${archive}.tmp"
+			[ -z "$archive_tmp" ] || rm -f "$archive_tmp"
 		fi
 	fi
 
@@ -2263,6 +2807,11 @@ emit_session() {
 			model=$(echo "$cargs" | sed -n 's/.*--model[= ] *\([^ ]*\).*/\1/p')
 		fi
 
+		# This shim only receives the composed target, so recover the parts from
+		# it. Splitting from the right is exact — see split_pane_target().
+		PANE_TARGET_SESSION="" PANE_TARGET_WINDOW="" PANE_TARGET_INDEX=""
+		split_pane_target "$target" || true
+
 		jq -n \
 			--arg pane "$target" \
 			--arg tool "$tool" \
@@ -2272,8 +2821,11 @@ emit_session() {
 			--arg model "$model" \
 			--arg cli_args "$cli_args" \
 			--arg copilot_home "$copilot_home" \
+			--arg session_name "$PANE_TARGET_SESSION" \
+			--arg window_index "$PANE_TARGET_WINDOW" \
+			--arg pane_index "$PANE_TARGET_INDEX" \
 			--argjson env "${env_json:-null}" \
-			'{pane: $pane, tool: $tool, session_id: $sid, cwd: $cwd, pid: $pid, model: $model, cli_args: $cli_args, env: $env, copilot_home: $copilot_home}' >>"$PARTS_FILE"
+			'{pane: $pane, tool: $tool, session_id: $sid, cwd: $cwd, pid: $pid, model: $model, cli_args: $cli_args, env: $env, copilot_home: $copilot_home, session_name: $session_name, window_index: $window_index, pane_index: $pane_index}' >>"$PARTS_FILE"
 		case "$tool" in
 		codex) register_codex_session_id "$session_id" ;;
 		pi) register_pi_session_id "$session_id" ;;
@@ -2281,10 +2833,7 @@ emit_session() {
 		esac
 		return 0
 	else
-		if [ "$log_missing" = "1" ]; then
-			log "detected $tool in $target (pid $cpid) but no session ID available"
-		fi
-		return 1
+		handle_sessionless_relaunch "$target" "$tool" "$cpid" "$cargs" "$cwd" "$log_missing"
 	fi
 }
 

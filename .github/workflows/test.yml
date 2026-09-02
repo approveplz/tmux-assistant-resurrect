@@ -11,6 +11,46 @@ permissions:
   checks: write
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    name: lint (shellcheck + ruff + node)
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install linters
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          # Pinned: an unpinned linter turns every upstream release into a
+          # potential red build on an unrelated day. ruff 0.16 widened its
+          # default rule set, which is exactly how that failure arrives.
+          # Bump deliberately, with the new findings reviewed in the same PR.
+          pip install --quiet ruff==0.16.5
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+
+      # Gate at error+warning severity (info-level findings are not blockers).
+      # SC1091: shellcheck cannot follow dynamic source paths — expected.
+      - name: shellcheck (scripts + hooks)
+        run: shellcheck --severity=warning --exclude=SC1091 scripts/*.sh hooks/*.sh *.tmux
+
+      # Test scripts are gated at the same level; targeted disable comments
+      # handle the intentional patterns (bare truncation, unused read vars).
+      - name: shellcheck (tests)
+        run: shellcheck --severity=warning --exclude=SC1091 test/*.sh
+
+      - name: ruff (Python helpers)
+        run: ruff check scripts/py/
+
+      - name: node --check (JS plugin)
+        run: node --check hooks/opencode-session-track.js
+
   test:
     runs-on: ubuntu-latest
     strategy:
@@ -57,6 +97,10 @@ jobs:
   # on contributors' machines. Issue #49 was exactly that: a `ps` keyword BSD
   # rejects, invisible to Linux CI. No Docker needed; tmux is installed below
   # for the contract suite, which drives a real Copilot in a pane.
+  #
+  # macOS also has the only $TMPDIR that genuinely differs between a hook and the
+  # tmux server (/var/folders/<hash>/T, one per login session) -- the divergence
+  # behind issue #65, which state-dir-unit-tests.sh pins.
   macos:
     runs-on: macos-latest
     name: macos (hermetic + real binary)
@@ -79,6 +123,18 @@ jobs:
         run: |
           bash test/copilot-unit-tests.sh
           bash test/grok-unit-tests.sh
+          bash test/target-resolution-unit-tests.sh
+          bash test/state-dir-unit-tests.sh
+          bash test/save-hardening-unit-tests.sh
+          bash test/restore-unit-tests.sh
+          bash test/plugin-hardening-unit-tests.sh
+
+      # The only tmux >= 3.7 in CI. Below 3.7 tmux rewrites ':' and '.' in
+      # session names to '_', so the Docker suites (tmux 3.4) cannot reach the
+      # target-grammar cases from issue #66 at all — they skip with a notice.
+      # This is where that behaviour is actually exercised against a real tmux.
+      - name: tmux target contract (real tmux)
+        run: bash test/tmux-target-contract-test.sh
 
       # Real binary, no authentication: Copilot writes the session directory and
       # its lock before the auth check, which is what this pins.
@@ -90,6 +146,8 @@ jobs:
   # Portability canary. tmux has no native Windows port, so the plugin cannot
   # run here and this is deliberately NOT a support claim -- it only catches
   # Linux-isms creeping into logic that WSL and MSYS2 users depend on.
+  # The save/plugin hardening suites intentionally stay in the Linux/macOS jobs:
+  # they verify POSIX symlink replacement, owner-only modes and signal status.
   windows:
     runs-on: windows-latest
     name: windows (portability canary)
@@ -103,6 +161,9 @@ jobs:
         run: |
           bash test/copilot-unit-tests.sh
           bash test/grok-unit-tests.sh
+          bash test/target-resolution-unit-tests.sh
+          bash test/state-dir-unit-tests.sh
+          bash test/restore-unit-tests.sh
 
   benchmark:
     runs-on: ubuntu-latest

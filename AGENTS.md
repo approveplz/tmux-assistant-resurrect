@@ -26,18 +26,32 @@ tmux-resurrect to save session IDs and restore them automatically.
   hook/plugin systems instead.
 - **Restore hook is the sole launcher**: Assistants must NOT be listed in
   `@resurrect-processes`. The post-restore hook handles all resuming with correct
-  session IDs. Adding them to `@resurrect-processes` causes double-launch.
+  session IDs. Adding them to `@resurrect-processes` causes double-launch, and
+  its prefix-only command matching can also mistake prompt text for a promoted
+  long-lived mode; session-less relaunches therefore use the same restore hook.
 - **TPM-only installation for end users**: Users install via TPM (`set -g @plugin
   'timvw/tmux-assistant-resurrect'` + `prefix + I`). The `justfile` recipes are
   for developers only.
-- **Pipe delimiter in tmux format output**: tmux 3.4 converts tabs and control
-  characters in `-F` output. Use `|` as delimiter (documented limitation: paths
-  containing `|` will break, but `|` is extremely rare in directory names).
+- **Pipe delimiter in tmux format output**: tmux before 3.7 converts tabs and
+  control characters in `-F` output, and does it differently per version (3.4
+  emits the octal escape, 3.5a the hex escape, 3.6 an underscore), so there is
+  no portable control-character delimiter to switch to. Use `|`. Because `|` is
+  legal in both session names and paths, **field order is the mitigation**: put
+  the one free-form field last in each `-F` string so awk can peel the
+  fixed-shape fields (a pid, numeric indices, a `/dev/...` tty) off the front by
+  position and take the remainder verbatim. If two free-form fields are needed,
+  emit two tagged records joined on a `|`-free key rather than widening one.
+  Never place a session name or path before another field. The join key must be
+  `#{pane_id}`, never `#{pane_pid}`: both are `|`-free, but the kernel can hand
+  a dead pane's pid to a new pane between the two `list-panes` calls and pair
+  one pane's metadata with another's cwd, whereas tmux never reuses a pane id
+  within a server.
 - **Two-guard restore**: The restore script has two independent guards before
   injecting a resume command into a pane: (1) the pane's foreground process must
   be a known shell, and (2) the pane must not already have a running assistant
   in its process tree. Both must pass. This prevents typing into TUIs or
-  double-launching.
+  double-launching. The saved cwd must also still be a directory; otherwise
+  leave the pane untouched rather than resume in an unrelated fallback cwd.
 - **Restore shell whitelist**: Guard 1 strips a leading `-` (login shells report
   as `-bash`, `-zsh`, etc.) then checks against a hardcoded whitelist: `bash`,
   `zsh`, `fish`, `sh`, `dash`, `ksh`, `tcsh`, `csh`, `nu`. If a user's shell
@@ -47,9 +61,11 @@ tmux-resurrect to save session IDs and restore them automatically.
 ## Detection approach
 
 Agent detection uses direct process inspection: the save script takes a single
-`ps -eo pid=,ppid=,args=` snapshot and matches child processes of tmux pane
-shells against known assistant binary names via `detect_tool()` in
-`scripts/lib-detect.sh`.
+`ps -eo pid=,ppid=,args=` snapshot, builds the complete parent/child map before
+walking it (never assume `ps` row order), and matches only the executable token
+or a script directly launched by a known runtime against assistant binary names
+via `detect_tool()` in `scripts/lib-detect.sh`. Never match assistant-looking
+path arguments elsewhere in a command line; `vim /tmp/claude` is not Claude.
 
 Session ID extraction uses tool-native mechanisms (state files, process args,
 JSONL lookup, SQLite database) -- this is infrastructure plumbing, not heuristic
@@ -61,7 +77,28 @@ process args as a reliable fallback.
 ## Key conventions
 
 - All scripts use `set -euo pipefail`
-- State files go to `$TMUX_ASSISTANT_RESURRECT_DIR` (default: `$XDG_RUNTIME_DIR` or `$TMPDIR` + `/tmux-assistant-resurrect`)
+- State files go to `$TMUX_ASSISTANT_RESURRECT_DIR` (default:
+  `$HOME/.local/state/tmux-assistant-resurrect`), resolved *only* through
+  `assistant_state_dir()` in `scripts/lib-detect.sh`. Never inline the path or
+  add an environment variable to it: the hooks and the save script resolve it in
+  different process environments, so anything they can disagree about silently
+  loses session IDs (issue #65). `hooks/opencode-session-track.js` carries the
+  one unavoidable second implementation; `test/state-dir-unit-tests.sh` pins the
+  two together. The pre-#65 locations are enumerated by
+  `legacy_assistant_state_dirs()` as a *set*, not re-derived from the old
+  expression: that expression is the thing that resolved differently on either
+  side, so evaluating it once in the save script would migrate only the users who
+  were never broken.
+- Create that directory only through `ensure_assistant_state_dir()`, never with a
+  bare `mkdir`. It exists because the obvious spellings are all wrong once the
+  path is three levels under `$HOME`: `mkdir -p -m 0700` applies the mode to the
+  deepest directory only (SC2174) *and* fails outright on Git Bash, taking the
+  whole save down with it under `set -e`; `mkdir -p` plus `chmod 700` leaves a
+  window at the umask default, follows a symlink left at the path, and resets a
+  mode the user chose, on every save. The leaf is created under a scoped umask
+  and an existing directory is left alone. `hooks/opencode-session-track.js`
+  mirrors this, with the extra Node trap that `mkdirSync`'s `mode` applies to
+  *every* level `recursive` creates.
 - State files contain the full tool-provided context (merged from hook stdin /
   plugin events) plus plugin metadata (`tool`, `ppid`/`pid`, `timestamp`, `env`).
   The Claude hook merges Claude's entire SessionStart JSON; the OpenCode plugin
@@ -147,13 +184,16 @@ process args as a reliable fallback.
   helper that parses `--help` needs a `SESSION_EXTRA_WARM_<tool>` entry.
   Otherwise `<tool> --help` re-execs once per pane on every save.
 - Log files go to `assistant-{save,restore}.log` in tmux-resurrect's save dir
-  (resolved by `resurrect_data_dir` in `lib-detect.sh`; truncated to 500 lines per run)
+  (resolved by `resurrect_data_dir` in `lib-detect.sh`; truncated to 500 lines per
+  run). Sidecars, state files, and logs contain session/environment data: create
+  them owner-only, publish JSON atomically, use unpredictable same-directory
+  temporary files, and never append through a symlinked log path.
 - Process inspection uses `ps -eo pid=,ppid=` (not `pgrep -P` -- unreliable on
   macOS) and builds a complete parent map before traversing descendants; `ps`
-  does not guarantee that parents appear before children
+  does not guarantee that parents appear before children.
 - Agent detection matches the executable token rather than later argument text.
   Keep `detect_tool()` and the batched awk detector in the save path aligned;
-  internal helpers such as Codex `app-server` are not resumable assistants
+  internal helpers such as Codex `app-server` are not resumable assistants.
 - Hook install uses two-phase matching: **exact equality** (`== $cmd`) to detect
   whether the current-path hook is already installed, and **substring match**
   (`contains("claude-session-track")`) to clean up stale copies left by path
@@ -162,16 +202,51 @@ process args as a reliable fallback.
   on hook entries that lack a `.command` field (e.g., URL-type hooks), and
   `.hooks` is null-coalesced before mapping to handle entries with missing/null
   hooks arrays
+- Hook commands for a plugin installed under `$HOME` are persisted as
+  `bash "$HOME"'/rest/of/path.sh'`, not as the expanded path. `settings.json` is
+  commonly tracked in a dotfiles repo, and an expanded path embeds `$HOME`, which
+  differs across machines -- different usernames, and `/Users` vs `/home` between
+  macOS and Linux -- so the two-phase matching rewrites it on every tmux start.
+  Only `$HOME` sits in double quotes; the remainder is single-quoted and adjacent,
+  so the shell concatenates them and a `$`, backtick, `$(...)` or `"` in the
+  install path stays literal. A naive `bash "$HOME/..."` would execute it.
+  Installs outside `$HOME` (Nix store, system-wide) have no portable prefix and
+  keep the single-quoted absolute path; both forms therefore share exactly one
+  limitation, a single quote in the install path (unlikely with TPM).
+  Substituting only `$HOME` is deliberate -- it is the one
+  variable guaranteed to be set in the hook's environment (Claude Code resolved
+  `~/.claude/settings.json` through it), and a second candidate prefix such as
+  `$XDG_CONFIG_HOME` would make the stored value depend on which machine ran the
+  install, reintroducing the churn
 - Use `posix_quote()` from `lib-detect.sh` for values sent to POSIX-ish/fish
   panes. When the pane shell is known and csh/tcsh is supported, use
   `shell_quote()` so history expansion and embedded quotes remain literal.
-- Hook command paths use single quotes (`bash '${CURRENT_DIR}/hooks/...'`);
-  this breaks if the install path contains a single quote (unlikely with TPM)
 - The sidecar JSON (`assistant-sessions.json`) entries include enriched fields:
   `model` (from state file or `--model` in args), `cli_args` (from `ps` args
   with binary name and session/resume args stripped), `env` (from state file),
-  and `copilot_home` for Copilot's resolved state root. All are optional for
-  backward compatibility.
+  `copilot_home` for Copilot's resolved state root, and `session_name` /
+  `window_index` / `pane_index` (the pane's address as separate values). All are
+  optional for backward compatibility.
+- Vouched session-less commands live in the sibling `.relaunch` array, never in
+  `.sessions`. Its `cmd` is only an exact lookup key; restore executes the
+  matching line from the user-owned voucher file. The shape filter only feeds
+  the advisory candidates ledger and must never authorize a relaunch. The
+  `relaunch-add` hazard list is likewise advisory-only and must never be read by
+  save or restore.
+- **Never hand a `session:window.pane` string to tmux as a target.** It is a
+  display label, not an address: tmux's target grammar reserves `:` and `.`,
+  session names may contain both (3.7 keeps them; 3.4-3.6 rewrote them to `_`),
+  and tmux prefix-matches session names, so a bad target does not merely fail —
+  it can resolve to the *wrong* session. `-t '=name'` does not help, because the
+  grammar splits the string before the exact-match flag applies. Resolve the
+  pane once via `resolve_tmux_pane_id()` in `lib-detect.sh`, which matches the
+  three parts literally against `tmux list-panes` output, and target the `%N` it
+  returns from then on. Pane ids are unique only within one tmux server
+  lifetime — exactly the boundary this plugin crosses — so they are resolved at
+  restore time and never persisted.
+- `.sessions[].pane` must keep the joined form regardless: it is what
+  `strip_assistant_pane_contents()` matches against tmux-resurrect's archive
+  member names. Add fields alongside it; do not repurpose or drop it.
 - `extract_cli_args()` in `save-assistant-sessions.sh` strips per-tool session
   args: Claude `--resume[= ]<id>`, Copilot session selectors (including
   `--name`, which Copilot refuses to combine with `--resume`) and initial-prompt
@@ -201,7 +276,8 @@ changes after an upgrade, check the relevant source to confirm.
 | **Some Codex versions write `~/.codex/session-tags.jsonl`** | Exact PID-to-session fallback if no open writer file is visible | Run Codex and check `cat ~/.codex/session-tags.jsonl` |
 | **Pi session files live in `~/.pi/agent/sessions/--<cwd>--/*.jsonl`** | Primary session ID source for Pi when `--session` is absent in args; save script reads header `type=id/cwd/timestamp` and scores candidates by process lifetime + mtime | Run Pi and inspect `~/.pi/agent/sessions`, verify first JSONL line has `{"type":"session","id":"..."}` |
 | **grok writes `~/.grok/active_sessions.json`** | Primary session ID source for Grok: an array of `{session_id, pid, cwd, opened_at}` for every live session, updated on open/close. `get_grok_session()` looks up by PID (works even for a bare `grok` with no args); `-r`/`--resume <uuid>` in process args is the fallback. `GROK_HOME` overrides the `~/.grok` base. | Run `grok`, then `cat ~/.grok/active_sessions.json`; confirm each running `grok` PID appears with its `session_id` |
-| **tmux-resurrect pane content archive** layout: `./pane_contents/pane-{session}:{window}.{pane}` inside `pane_contents.tar.gz` | `strip_assistant_pane_contents()` removes assistant pane files from this archive to prevent stale TUI flash on restore | tmux-resurrect source: `scripts/helpers.sh:pane_contents_file()` |
+| **tmux-resurrect pane content archive** layout: `./pane_contents/pane-{session}:{window}.{pane}` inside `pane_contents.tar.gz` | `strip_assistant_pane_contents()` removes assistant pane files from this archive to prevent stale TUI flash on restore. The filename shape is dictated by upstream, so `.sessions[].pane` has to keep the joined `session:window.pane` form to match it — this is the one place that string is correct to use, and it is a filename, never a tmux target | tmux-resurrect source: `scripts/helpers.sh:pane_contents_file()` |
+| **tmux >= 3.7 permits `:`, `.` and `\|` in session names** | 3.4-3.6 silently rewrote `:` and `.` to `_`, so saved pane labels change shape across that boundary; only TAB and NEWLINE are rejected outright. This is why a saved label cannot be parsed or used as a target (issue #66) | `tmux new-session -d -s 'a:b.c\|d'; tmux list-sessions -F '#{session_name}'` |
 
 ## Platform gotchas
 
@@ -210,7 +286,7 @@ These are hard-won lessons. Do not "simplify" them away.
 | Gotcha | Details |
 |--------|---------|
 | **macOS `pgrep -P` is unreliable** | Silently misses child processes. Always use `ps -eo pid=,ppid=` with awk |
-| **tmux 3.4 mangles delimiters** | Converts tabs to underscores, control characters to octal escapes in `-F` output. Use `|` (plain pipe) as delimiter |
+| **tmux < 3.7 mangles delimiters** | Tabs become underscores; control characters are escaped differently per version (3.4 octal, 3.5a hex, 3.6 underscore), so no control character is a portable delimiter. Use `|` (plain pipe), and order the `-F` fields so the free-form one is last — `|` is legal in both session names and paths |
 | **`printf %q` breaks fish shell** | Not POSIX. Use `posix_quote()` (single-quote wrapping with `'\''` escaping) instead |
 | **`\|\| continue` inside `$()` runs in the subshell** | `continue` executes but only affects the subshell, not the outer loop. Place `\|\| continue` outside the `$()` |
 | **`kill -0 0` succeeds** | Checks current process group, not PID 0. Always validate PIDs are numeric and > 1 before `kill -0` |
@@ -235,6 +311,22 @@ artifact it then looks for cannot notice upstream changing the layout:
 | Hermetic | `test/copilot-unit-tests.sh` | lock integrity, stale locks, argv fallback, `extract_cli_args` |
 | Authenticated | `test/copilot-e2e-authenticated.sh` | whether a real conversation actually comes back |
 
+Pane target resolution is layered the same way, for the same reason -- a
+hermetic test that fabricates a `list-panes` table cannot notice tmux changing
+what it emits or what it accepts:
+
+| Layer | File | Catches |
+|-------|------|---------|
+| Contract | `test/tmux-target-contract-test.sh` | tmux changing session-name handling or its target grammar (needs tmux >= 3.7; skips below) |
+| End-to-end | `test/run-tests.sh` `hostile_session_names` | save/restore wiring for a `\|` name; `:`/`.` names when tmux keeps them |
+| Hermetic | `test/target-resolution-unit-tests.sh` | `split_pane_target` / `match_pane_id` parsing, on every platform; plus static guards on the save hook's two `-F` record shapes |
+
+The static guards in the hermetic suite exist because the awk that joins those
+two records is embedded in the save hook and cannot be driven in isolation.
+They pin the join key to `#{pane_id}` and keep each record's free-form field
+last. Swapping the key back to `#{pane_pid}` looks harmless and no behavioural
+test would notice it -- see the pipe delimiter rule at the top of this file.
+
 **Run the authenticated test after touching Copilot session discovery**
 (`GH_TOKEN=$(gh auth token) just test-copilot-e2e`). It is the only layer that
 can tell a resumable session from an unresumable one: unauthenticated Copilot
@@ -247,9 +339,13 @@ the session directory and its lock before the auth check runs. Launch it in the
 integration test with *no* session selector, so the UUID exists only in the lock
 and a regressed lookup cannot be masked by the argv fallback.
 
-CI covers three platforms. The Docker suites (bash 5 and bash 3.2) run on Linux;
+CI covers three platforms. The Docker suites (bash 5 and bash 3.2) run on Linux
+and are the only place the hermetic suites meet bash 3.2, so `run-tests.sh`
+invokes them itself rather than leaving them to the macOS job alone;
 a `macos-latest` job runs the hermetic suites plus the real-binary Copilot
-contract suite, because every BSD path — `stat -f`, the `ps -o etime=`
+contract suite and the tmux target contract suite -- it is also the only job
+with a tmux new enough (brew, >= 3.7) to keep `:` and `.` in a session name,
+so the issue #66 cases are unreachable anywhere else -- because every BSD path — `stat -f`, the `ps -o etime=`
 process-start fallback, and the flattened-argv heuristic that exists only
 because `/proc/<pid>/cmdline` is unavailable — is otherwise exercised nowhere but
 a contributor's laptop; and a `windows-latest` canary runs the hermetic suites
@@ -258,6 +354,17 @@ under Git Bash to catch Linux-isms, without implying Windows is supported.
 ```bash
 # Run the full test suite in Docker
 just test
+
+# Hermetic suites (no Docker, no tmux, no assistant binaries)
+just test-targets                  # saved-pane target resolution
+just test-grok
+just test-copilot
+just test-save-hardening           # save/process detection and file safety
+just test-restore                  # restore validation, quoting, failure isolation
+just test-plugin-hardening         # hooks, installers, and Python helpers
+
+# Real tmux, own socket; skips without tmux or below tmux 3.7
+just test-tmux-contract
 
 # Manual debugging on a live system
 just save                          # trigger a save manually
@@ -276,6 +383,15 @@ cat ~/.local/share/tmux/resurrect/assistant-restore.log
   `wait_for_death`) instead of fixed `sleep` -- fast on fast machines,
   tolerant on slow CI.
 - `kill_pane_children()` does tree-walk cleanup instead of inline kill patterns.
+- The Docker image ships tmux 3.4, which rewrites `:` and `.` in session names
+  to `_`. A test that asks for a session called `v1.2` there gets `v1_2` and
+  passes without testing anything. The `hostile_session_names` suite in
+  `test/run-tests.sh` therefore asks tmux (`new-session -P -F
+  '#{session_name}'`) what name it actually created and skips-with-notice when
+  it was rewritten, rather than parsing a version string. `|` is never
+  rewritten, so it is the case that reproduces on every version, and
+  `test/target-resolution-unit-tests.sh` covers the parsing itself on all
+  platforms by driving the functions against a fabricated pane table.
 - npm packages are pinned to major versions: `claude-code@^2`,
   `@github/copilot@^1`, `codex@^0`, `opencode-ai@^1`, `pi-coding-agent@^0`.
 
