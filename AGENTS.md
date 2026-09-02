@@ -121,6 +121,10 @@ process args as a reliable fallback.
   cannot read another process's env unprivileged, so hookless tools capture no
   env there — document the shell-profile / `tmux set-environment` workaround
   instead.
+- Codex rewind can leave the prior and current root rollouts open in the same
+  process. Exclude rollouts whose `session_meta.source` identifies a subagent,
+  then select the unique newest root by `session_meta.timestamp`. Missing or
+  tied timestamps are ambiguous and must not fall through to stale launch args.
 - Copilot exposes a PID-specific active-session signal: the live session writes
   `$COPILOT_HOME/session-state/<uuid>/inuse.<pid>.lock` (content = the same PID).
   Resolve it with a single glob — no `/proc`, no `lsof`, no platform branch, and

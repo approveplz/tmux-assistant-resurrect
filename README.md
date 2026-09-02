@@ -63,7 +63,7 @@ Session ID extraction uses tool-native mechanisms (infrastructure plumbing):
 | **Claude Code** | `SessionStart` hook state file (keyed by Claude PID) | `--resume` / `--session-id` in process args | - | Claude overwrites its process title, so args fallback only works if args are visible |
 | **GitHub Copilot CLI** | `$COPILOT_HOME/session-state/<uuid>/inuse.<pid>.lock` written by the live session | `--session-id` / `--resume` in process args | - | Plain glob keyed on the native PID — no `/proc`, no `lsof`, so it behaves identically on Linux, WSL and macOS |
 | **OpenCode** | `-s` / `--session` in process args | Plugin state file | SQLite DB query (`~/.local/share/opencode/opencode.db`) | Go binary overwrites process title; DB fallback matches most recent session by cwd |
-| **Codex CLI** | Root rollout file held open by the live PID | PID lookup in `~/.codex/session-tags.jsonl` | `resume` in process args | Uses `/proc/<pid>/fd` on Linux/WSL and `lsof` on macOS; rollout metadata separates the pane root from subagents, and the resolver never guesses from cwd |
+| **Codex CLI** | Root rollout file held open by the live PID | PID lookup in `~/.codex/session-tags.jsonl` | `resume` in process args | Uses `/proc/<pid>/fd` on Linux/WSL and `lsof` on macOS; rollout metadata separates roots from subagents and selects the newest root after rewind |
 | **Pi** | Session header lookup in `~/.pi/agent/sessions/--<cwd>--/*.jsonl` | `--session` in process args | - | Session-file lookup is cwd-scoped and uses process-time scoring + dedup |
 | **Oh My Pi** | Terminal breadcrumb + session JSONL lookup (`$XDG_STATE_HOME/omp`, `$XDG_DATA_HOME/omp`) | `--resume` / `-r` in process args | `--session-dir` / `--profile` scoped lookup | Distinct `omp` tool; no hook/plugin required |
 | **Grok** | PID lookup in `~/.grok/active_sessions.json` | `-r` / `--resume <uuid>` in process args | - | Registry records every live session (including a bare `grok` with no args) keyed by PID, so sessions sharing a cwd never collide; no hook/plugin required |
@@ -690,12 +690,14 @@ no additional hook is needed.
 
 Some Codex versions also publish PID-to-session mappings in
 `~/.codex/session-tags.jsonl`, and a restored process exposes its ID as
-`codex resume <id>`. Those are exact fallbacks. If the process exposes no exact
-root ID, exposes ambiguous root IDs, or repeats an ID already assigned to
-another pane, the save is skipped. Open subagent rollouts are explicitly
-excluded using their `session_meta` source. The plugin deliberately does not
-guess from cwd, because several Codex panes can legitimately share one
-directory.
+`codex resume <id>`. Those are exact fallbacks. Rewind can leave both the old
+and current root rollouts open. When that happens, the unique newest
+`session_meta.timestamp` identifies the current root; open subagent rollouts
+are excluded using their `session_meta` source. If the roots have missing or
+tied timestamps, or an ID repeats one already assigned to another pane, the
+save is skipped instead of falling through to stale launch arguments. The
+plugin deliberately does not guess from cwd, because several Codex panes can
+legitimately share one directory.
 
 ### GitHub Copilot CLI
 

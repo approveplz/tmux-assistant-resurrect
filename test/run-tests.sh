@@ -1531,6 +1531,7 @@ codex_open_rollout="$CODEX_OPEN_TEST_DIR/sessions/rollout-2026-08-13T00-00-00-${
 hold_codex_files_open() {
 	exec 3>>"$1"
 	[ -z "${2:-}" ] || exec 4>>"$2"
+	[ -z "${3:-}" ] || exec 5>>"$3"
 	sleep 30
 }
 
@@ -1568,6 +1569,37 @@ assert_eq "Codex distinguishes pane root from open subagent sessions" \
 	"$codex_root_sid" "$codex_root_actual"
 kill "$codex_subagent_pid" 2>/dev/null || true
 wait "$codex_subagent_pid" 2>/dev/null || true
+
+codex_rewind_old_sid="44444444-5555-4666-8777-888888888888"
+codex_rewind_current_sid="55555555-6666-4777-8888-999999999999"
+codex_rewind_subagent_sid="66666666-7777-4888-8999-aaaaaaaaaaaa"
+codex_rewind_old_rollout="$CODEX_OPEN_TEST_DIR/sessions/rollout-rewind-old-${codex_rewind_old_sid}.jsonl"
+codex_rewind_current_rollout="$CODEX_OPEN_TEST_DIR/sessions/rollout-rewind-current-${codex_rewind_current_sid}.jsonl"
+codex_rewind_subagent_rollout="$CODEX_OPEN_TEST_DIR/sessions/rollout-rewind-subagent-${codex_rewind_subagent_sid}.jsonl"
+printf '{"type":"session_meta","payload":{"id":"%s","timestamp":"2026-09-02T19:30:51.136Z","source":"cli"}}\n' \
+	"$codex_rewind_old_sid" >"$codex_rewind_old_rollout"
+printf '{"type":"session_meta","payload":{"id":"%s","timestamp":"2026-09-02T20:48:54.794Z","source":"cli"}}\n' \
+	"$codex_rewind_current_sid" >"$codex_rewind_current_rollout"
+printf '{"type":"session_meta","payload":{"id":"%s","timestamp":"2026-09-02T20:49:00.000Z","source":{"subagent":{}}}}\n' \
+	"$codex_rewind_subagent_sid" >"$codex_rewind_subagent_rollout"
+hold_codex_files_open "$codex_rewind_old_rollout" "$codex_rewind_current_rollout" \
+	"$codex_rewind_subagent_rollout" &
+codex_rewind_pid=$!
+
+for _i in $(seq 1 50); do
+	codex_rewind_count=$(codex_open_file_paths "$codex_rewind_pid" | grep -c '/rollout-' || true)
+	[ "$codex_rewind_count" -ge 3 ] && break
+	sleep 0.1
+done
+assert_eq "Codex rewind selects the newest root instead of stale resume args" \
+	"$codex_rewind_current_sid" \
+	"$(get_codex_session "$codex_rewind_pid" "codex resume $codex_rewind_old_sid")"
+printf '{"type":"session_meta","payload":{"id":"%s","timestamp":"2026-09-02T19:30:51.136Z","source":"cli"}}\n' \
+	"$codex_rewind_current_sid" >"$codex_rewind_current_rollout"
+assert_eq "Codex rewind rejects tied root timestamps instead of stale resume args" "" \
+	"$(get_codex_session "$codex_rewind_pid" "codex resume $codex_rewind_old_sid")"
+kill "$codex_rewind_pid" 2>/dev/null || true
+wait "$codex_rewind_pid" 2>/dev/null || true
 
 hold_codex_files_open "$codex_subagent_rollout" &
 codex_subagent_only_pid=$!

@@ -667,8 +667,8 @@ codex_open_file_paths() {
 }
 
 get_codex_session_from_open_files() {
-	local child_pid="$1" file sid metadata metadata_record metadata_sid metadata_kind
-	local ids="" root_ids="" subagent_ids=""
+	local child_pid="$1" file sid metadata metadata_record metadata_sid metadata_kind metadata_timestamp
+	local ids="" root_ids="" root_records="" subagent_ids="" latest_root
 
 	while IFS= read -r file; do
 		case "$file" in
@@ -680,8 +680,8 @@ get_codex_session_from_open_files() {
 			sid=$(printf '%s\n' "$file" | sed -n \
 				's#^.*/rollout-.*-\([0-9a-fA-F]\{8\}-[0-9a-fA-F]\{4\}-[0-9a-fA-F]\{4\}-[0-9a-fA-F]\{4\}-[0-9a-fA-F]\{12\}\)\.jsonl$#\1#p')
 			# Subagent threads share the root process and therefore its open-file
-			# table. Their session_meta source is explicitly tagged `subagent`;
-			# the one non-subagent rollout is the pane's resumable root.
+			# table. Rewind can also leave the prior root rollout open, so retain
+			# each root's creation timestamp to identify the current one below.
 			metadata=""
 			[ ! -r "$file" ] || IFS= read -r metadata <"$file" || true
 			metadata_record=$(printf '%s\n' "$metadata" | jq -r '
@@ -689,17 +689,21 @@ get_codex_session_from_open_files() {
 				| [
 					.payload.id,
 					if ((.payload.source | type) == "object" and (.payload.source | has("subagent")))
-					then "subagent" else "root" end
+					then "subagent" else "root" end,
+					(.payload.timestamp | if type == "string" then . else "" end)
 				]
 				| @tsv
 			' 2>/dev/null || true)
 			metadata_sid="${metadata_record%%$'\t'*}"
-			metadata_kind="${metadata_record#*$'\t'}"
+			metadata_record="${metadata_record#*$'\t'}"
+			metadata_kind="${metadata_record%%$'\t'*}"
+			metadata_timestamp="${metadata_record#*$'\t'}"
 			if [ "$metadata_sid" = "$sid" ] && is_codex_session_id "$metadata_sid"; then
 				if [ "$metadata_kind" = "subagent" ]; then
 					subagent_ids="${subagent_ids}${metadata_sid}"$'\n'
 				else
 					root_ids="${root_ids}${metadata_sid}"$'\n'
+					root_records="${root_records}${metadata_timestamp}"$'\t'"${metadata_sid}"$'\n'
 				fi
 			fi
 			;;
@@ -712,7 +716,27 @@ get_codex_session_from_open_files() {
 	root_ids=$(printf '%s' "$root_ids" | sed '/^$/d' | LC_ALL=C sort -u)
 	case "$root_ids" in
 	'') ;;
-	*$'\n'*) return 0 ;;
+	*$'\n'*)
+		# Codex emits UTC ISO timestamps whose lexical order is chronological.
+		# Require one timestamp per root and a unique newest root. Otherwise the
+		# open files are authoritative but ambiguous, so callers must not fall
+		# through to a potentially stale resume argument.
+		latest_root=$(printf '%s' "$root_records" | LC_ALL=C sort -ru | awk -F '\t' '
+			$1 == "" || $2 == "" { invalid = 1 }
+			NR == 1 {
+				latest_timestamp = $1
+				winner = $2
+				next
+			}
+			$1 == latest_timestamp && $2 != winner { tied = 1 }
+			END {
+				if (!invalid && !tied && winner != "") print winner
+			}
+		')
+		[ -n "$latest_root" ] || return 1
+		printf '%s\n' "$latest_root"
+		return 0
+		;;
 	*) printf '%s\n' "$root_ids"; return 0 ;;
 	esac
 
@@ -734,7 +758,11 @@ get_codex_session() {
 	# Primary: the live process keeps its writer lock and rollout file open.
 	# Resolve those PID-owned files through /proc on Linux/WSL or lsof on macOS,
 	# and use rollout metadata to separate the pane root from its subagents.
-	sid=$(get_codex_session_from_open_files "$child_pid")
+	# A non-zero result means the live PID owns multiple root rollouts that
+	# cannot be ordered. Do not replace that evidence with stale launch args.
+	if ! sid=$(get_codex_session_from_open_files "$child_pid"); then
+		return
+	fi
 	if codex_session_id_available "$sid"; then
 		echo "$sid"
 		return
