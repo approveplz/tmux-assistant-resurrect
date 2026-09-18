@@ -699,6 +699,11 @@ save is skipped instead of falling through to stale launch arguments. The
 plugin deliberately does not guess from cwd, because several Codex panes can
 legitimately share one directory.
 
+If Codex is configured with `terminal_title = ["thread-id"]`, the pane title is
+an additional fallback. Full IDs and Codex's 29-character prefix followed by
+`...`, with any transient activity suffix removed, are accepted only when they
+identify one fresh, non-subagent rollout.
+
 ### GitHub Copilot CLI
 
 A live Copilot session marks its own state directory with a lock file naming

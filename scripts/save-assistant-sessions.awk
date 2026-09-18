@@ -13,9 +13,10 @@ function peel(   i, field) {
 }
 
 NR == FNR {
-	# First file: pane data, two record types keyed by pane id:
+	# First file: pane data, three record types keyed by pane id:
 	#   P|pane_id|pane_pid|window_index|pane_index|pane_tty|session_name
 	#   C|pane_id|pane_current_path
+	#   T|pane_id|pane_title
 	# Both end in a field that may contain the delimiter itself, so peel the
 	# fixed-shape fields and keep the rest of the line verbatim.
 	rec = $0
@@ -23,6 +24,7 @@ NR == FNR {
 	key = peel()
 	if (tag == "" || key == "") next
 	if (tag == "C") { pane_cwd[key] = rec; next }
+	if (tag == "T") { pane_title[key] = rec; next }
 	if (tag != "P") next
 	pid = peel()
 	win = peel()
@@ -67,10 +69,11 @@ END {
 		sess = pane_session[key]
 		win = pane_window[key]
 		idx = pane_index[key]
+		title = pane_title[key]
 
 		# Check pane PID itself (handles exec-replaced shells)
 		if (root in proc_tool && proc_tool[root] != "") {
-			printf "%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\n", target, proc_tool[root], root, proc_args[root], cwd, tty, sess, win, idx
+			printf "%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", target, proc_tool[root], root, proc_args[root], cwd, tty, sess, win, idx, title
 		}
 
 		# BFS through descendant processes
@@ -88,7 +91,7 @@ END {
 		while (qs <= qe) {
 			cur = queue[qs++]+0
 			if (cur in proc_tool && proc_tool[cur] != "") {
-				printf "%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\n", target, proc_tool[cur], cur, proc_args[cur], cwd, tty, sess, win, idx
+				printf "%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", target, proc_tool[cur], cur, proc_args[cur], cwd, tty, sess, win, idx, title
 			}
 			if (cur in child_list) {
 				nc = split(child_list[cur], kids, SUBSEP)

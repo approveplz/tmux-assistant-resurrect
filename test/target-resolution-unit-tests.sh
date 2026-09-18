@@ -138,7 +138,7 @@ assert_eq "has|pipe:0.0 -> pane id" "%3" "$(round_trip 'has|pipe:0.0')"
 assert_eq "work:1.2 -> pane id" "%4" "$(round_trip 'work:1.2')"
 assert_eq "back\\slash:0.0 -> pane id" "%6" "$(round_trip 'back\slash:0.0')"
 
-echo "== save side: the two pane records join on pane id, free-form field last =="
+echo "== save side: pane records join on pane id, free-form field last =="
 # Static guards, in the style of the issue #48 heredoc suite, because the awk
 # that consumes these records is embedded in the save hook and cannot be driven
 # in isolation. Two properties have to survive future edits:
@@ -149,13 +149,14 @@ echo "== save side: the two pane records join on pane id, free-form field last =
 #      list-panes calls, pairing one pane's metadata with another's cwd. tmux
 #      never reuses a pane id within a server.
 #   2. Each record ends with its one field that may contain the '|' delimiter
-#      (the session name, the pane path). Everything ahead of it is peeled off
-#      by position; a field appended after it would be swallowed by a session
+#      (the session name, pane path, or pane title). Everything ahead of it is
+#      peeled off by position; a field appended after it would be swallowed by a session
 #      named "a|b".
 SAVE_SH="$REPO_DIR/scripts/save-assistant-sessions.sh"
 pane_formats=$(grep -o 'list-panes -a -F "[^"]*"' "$SAVE_SH" | sed 's/.*-F "//; s/"$//')
 p_format=$(printf '%s\n' "$pane_formats" | grep '^P|' || true)
 c_format=$(printf '%s\n' "$pane_formats" | grep '^C|' || true)
+t_format=$(printf '%s\n' "$pane_formats" | grep '^T|' || true)
 
 starts_with() {
 	case "$2" in "$1"*) echo yes ;; *) echo no ;; esac
@@ -166,8 +167,10 @@ contains() {
 
 assert_eq "P record: tag, then pane id as the join key" "yes" "$(starts_with 'P|#{pane_id}|' "$p_format")"
 assert_eq "C record: tag, then the same join key" "yes" "$(starts_with 'C|#{pane_id}|' "$c_format")"
+assert_eq "T record: tag, then the same join key" "yes" "$(starts_with 'T|#{pane_id}|' "$t_format")"
 assert_eq "P record ends with the session name" "#{session_name}" "${p_format##*|}"
 assert_eq "C record ends with the pane path" "#{pane_current_path}" "${c_format##*|}"
+assert_eq "T record ends with the pane title" "#{pane_title}" "${t_format##*|}"
 assert_eq "P record still carries the pid, as data" "yes" "$(contains '|#{pane_pid}|' "$p_format")"
 
 echo

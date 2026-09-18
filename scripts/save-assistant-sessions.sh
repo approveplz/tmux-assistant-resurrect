@@ -750,9 +750,53 @@ get_codex_session_from_open_files() {
 	printf '%s\n' "$ids"
 }
 
+get_codex_session_from_pane_title() {
+	local child_pid="$1" title="${2:-}" prefix="" root file sid metadata_sid
+	local ids="" evidence=0
+	case "$title" in
+	????????-????-????-????-?????...\ *) title="${title%% *}" ;;
+	esac
+	case "$title" in
+	????????-????-????-????-????????????)
+		is_codex_session_id "$title" || return 0
+		prefix="$title"
+		;;
+	????????-????-????-????-?????...) prefix="${title%...}" ;;
+	*) return 0 ;;
+	esac
+
+	root="${CODEX_HOME:-$HOME/.codex}"
+	while IFS= read -r file; do
+		[ -n "$file" ] || continue
+		sid=$(printf '%s\n' "$file" | sed -n \
+			's#^.*/rollout-.*-\([0-9a-fA-F]\{8\}-[0-9a-fA-F]\{4\}-[0-9a-fA-F]\{4\}-[0-9a-fA-F]\{4\}-[0-9a-fA-F]\{12\}\)\.jsonl$#\1#p')
+		is_codex_session_id "$sid" || continue
+		case "$sid" in "$prefix"*) ;; *) continue ;; esac
+
+		metadata_sid=$(sed -n '1p' "$file" | jq -r '
+			select(.type == "session_meta")
+			| select(if ((.payload.source | type) == "object" and (.payload.source | has("subagent"))) then false else true end)
+			| .payload.id // empty
+		' 2>/dev/null || true)
+		[ "$metadata_sid" = "$sid" ] || { evidence=1; continue; }
+		evidence=1
+		_file_predates_process "$file" "$child_pid" && continue
+		ids="${ids}${sid}"$'\n'
+	done < <(find "$root/sessions" "$root/archived_sessions" -type f \
+		-name "rollout-*-${prefix}*.jsonl" -print 2>/dev/null || true)
+
+	ids=$(printf '%s' "$ids" | sed '/^$/d' | LC_ALL=C sort -u)
+	case "$ids" in
+	'') [ "$evidence" -eq 0 ] || return 1 ;;
+	*$'\n'*) return 1 ;;
+	*) printf '%s\n' "$ids" ;;
+	esac
+}
+
 get_codex_session() {
 	local child_pid="$1"
 	local args="$2"
+	local pane_title="${3:-}"
 	local sid
 
 	# Primary: the live process keeps its writer lock and rollout file open.
@@ -780,7 +824,18 @@ get_codex_session() {
 		fi
 	fi
 
-	# Fallback 2: resume arg in process args (chicken-and-egg fallback).
+	# Fallback 2: Codex's thread-id terminal title, when configured. Match the
+	# exact or uniquely truncated title to a fresh root rollout. This remains
+	# PID-bounded by the process start time and never guesses from cwd.
+	if ! sid=$(get_codex_session_from_pane_title "$child_pid" "$pane_title"); then
+		return
+	fi
+	if codex_session_id_available "$sid"; then
+		echo "$sid"
+		return
+	fi
+
+	# Fallback 3: resume arg in process args (chicken-and-egg fallback).
 	# After restore, codex is launched as `codex resume <session_id>`.
 	sid=$(printf '%s\n' "$args" | awk '
 		{
@@ -2261,6 +2316,7 @@ resolve_pane_candidates() {
 	local pane_session="${9:-}"
 	local pane_window="${10:-}"
 	local pane_pane_index="${11:-}"
+	local pane_title="${12:-}"
 
 	local resolved=0 first_tool="" first_pid="" first_args=""
 	for pass in 1 2; do
@@ -2313,7 +2369,7 @@ resolve_pane_candidates() {
 				session_id="$cached_sid"
 				[ -z "$session_id" ] && session_id=$(get_opencode_session "$cand_pid" "$cand_args" "$pane_cwd" "$allow_deferred_fallback" || true)
 				;;
-			codex) session_id=$(get_codex_session "$cand_pid" "$cand_args" "$pane_cwd" || true) ;;
+			codex) session_id=$(get_codex_session "$cand_pid" "$cand_args" "$pane_title" || true) ;;
 			pi) session_id=$(get_pi_session "$cand_pid" "$cand_args" "$pane_cwd" || true) ;;
 			omp) session_id=$(get_omp_session "$cand_pid" "$cand_args" "$pane_cwd" "$pane_tty" || true) ;;
 			grok) session_id=$(get_grok_session "$cand_pid" "$cand_args" || true) ;;
@@ -2552,11 +2608,11 @@ main() {
 		rm -f "$PS_FILE" "$PANE_FILE" "$PARTS_FILE" "$RELAUNCH_PARTS_FILE"
 		return 1
 	fi
-	# Two tagged records per pane, both ending in the one field that may itself
-	# contain the '|' delimiter (the session name / the pane path). Everything
+	# Three tagged records per pane, each ending in the one field that may itself
+	# contain the '|' delimiter (the session name, pane path, or pane title). Everything
 	# before it is '|'-free — a pane id, a pid, numeric indices, a /dev/... tty —
 	# so awk can peel those off the front by position and take the rest verbatim.
-	# Emitting the two free-form fields on separate records is what keeps them
+	# Emitting the free-form fields on separate records is what keeps them
 	# from shifting each other.
 	#
 	# A control-character delimiter would be simpler but is not portable: tmux
@@ -2576,6 +2632,7 @@ main() {
 	{
 		tmux list-panes -a -F "P|#{pane_id}|#{pane_pid}|#{window_index}|#{pane_index}|#{pane_tty}|#{session_name}"
 		tmux list-panes -a -F "C|#{pane_id}|#{pane_current_path}"
+		tmux list-panes -a -F "T|#{pane_id}|#{pane_title}"
 	} >"$PANE_FILE"
 
 	# --- Single awk pass: detect assistant tools across ALL pane process trees ---
@@ -2583,7 +2640,7 @@ main() {
 	# Reads pane list + ps snapshot, builds process tree in memory,
 	# BFS-walks descendants for each pane PID, detects tools.
 	# Output (tab-delimited):
-	#   target\ttool\ttool_pid\ttool_args\tcwd\tpane_tty\tsession\twindow\tindex
+	#   target\ttool\ttool_pid\ttool_args\tcwd\tpane_tty\tsession\twindow\tindex\ttitle
 	# The session/window/index columns are appended rather than inserted so that
 	# `cut -f2` in _warm_session_discovery() still selects the tool.
 	# NOTE: emit all candidates per pane (pane PID + descendants) in BFS order.
@@ -2658,13 +2715,13 @@ main() {
 	# Process only matched panes (those with a detected tool)
 	if [ -n "$MATCHES" ]; then
 		local current_target="" current_cwd="" current_tty="" pane_candidates=""
-		local current_sess="" current_win="" current_idx=""
-		while IFS=$'\t' read -r target tool cpid cargs cwd tty sess win idx; do
+		local current_sess="" current_win="" current_idx="" current_title=""
+		while IFS=$'\t' read -r target tool cpid cargs cwd tty sess win idx title; do
 			[ -z "$target" ] && continue
 
 			# If pane changed, process the previous pane's candidate list.
 			if [ -n "$current_target" ] && [ "$target" != "$current_target" ]; then
-				resolve_pane_candidates "$current_target" "$current_cwd" "$current_tty" "$pane_candidates" "$US" "$HAS_ASSOC_CACHE" "$STATE_CACHE_FILE" "$PARTS_FILE" "$current_sess" "$current_win" "$current_idx"
+				resolve_pane_candidates "$current_target" "$current_cwd" "$current_tty" "$pane_candidates" "$US" "$HAS_ASSOC_CACHE" "$STATE_CACHE_FILE" "$PARTS_FILE" "$current_sess" "$current_win" "$current_idx" "$current_title"
 				pane_candidates=""
 			fi
 
@@ -2674,6 +2731,7 @@ main() {
 			current_sess="$sess"
 			current_win="$win"
 			current_idx="$idx"
+			current_title="$title"
 			# Candidate tuples are US-delimited; a literal \x1f inside process args
 			# would break parsing, but this is practically unlikely for CLI argv.
 			pane_candidates="${pane_candidates}${tool}${US}${cpid}${US}${cargs}"$'\n'
@@ -2681,7 +2739,7 @@ main() {
 
 		# Process final pane candidate list.
 		if [ -n "$current_target" ] && [ -n "$pane_candidates" ]; then
-			resolve_pane_candidates "$current_target" "$current_cwd" "$current_tty" "$pane_candidates" "$US" "$HAS_ASSOC_CACHE" "$STATE_CACHE_FILE" "$PARTS_FILE" "$current_sess" "$current_win" "$current_idx"
+			resolve_pane_candidates "$current_target" "$current_cwd" "$current_tty" "$pane_candidates" "$US" "$HAS_ASSOC_CACHE" "$STATE_CACHE_FILE" "$PARTS_FILE" "$current_sess" "$current_win" "$current_idx" "$current_title"
 		fi
 	fi
 

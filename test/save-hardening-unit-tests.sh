@@ -90,6 +90,52 @@ register_omp_session_id bc
 assert_eq "OMP IDs that are substrings remain distinct" \
 	$'\tabc\tbc' "$USED_OMP_SESSION_IDS"
 
+echo "== Codex pane-title session fallback =="
+CODEX_TITLE_HOME="$SANDBOX/codex-home"
+CODEX_TITLE_SESSIONS="$CODEX_TITLE_HOME/sessions/2026/09/18"
+mkdir -p "$CODEX_TITLE_SESSIONS"
+CODEX_TITLE_ID="11111111-2222-4333-8444-555555555555"
+CODEX_TITLE_AMBIGUOUS="11111111-2222-4333-8444-55555aaaaaaa"
+CODEX_TITLE_SUBAGENT="66666666-7777-4888-8999-aaaaaaaaaaaa"
+printf '{"type":"session_meta","payload":{"id":"%s","timestamp":"2026-09-18T20:00:00Z","source":"cli"}}\n' \
+	"$CODEX_TITLE_ID" >"$CODEX_TITLE_SESSIONS/rollout-root-$CODEX_TITLE_ID.jsonl"
+CODEX_HOME="$CODEX_TITLE_HOME" assert_eq "full Codex thread title resolves its rollout" \
+	"$CODEX_TITLE_ID" "$(CODEX_HOME="$CODEX_TITLE_HOME" get_codex_session_from_pane_title "$$" "$CODEX_TITLE_ID")"
+CODEX_HOME="$CODEX_TITLE_HOME" assert_eq "truncated Codex thread title resolves one rollout" \
+	"$CODEX_TITLE_ID" "$(CODEX_HOME="$CODEX_TITLE_HOME" get_codex_session_from_pane_title "$$" "${CODEX_TITLE_ID:0:29}...")"
+CODEX_HOME="$CODEX_TITLE_HOME" assert_eq "truncated Codex title with activity suffix resolves one rollout" \
+	"$CODEX_TITLE_ID" "$(CODEX_HOME="$CODEX_TITLE_HOME" get_codex_session_from_pane_title "$$" "${CODEX_TITLE_ID:0:29}... ⠋")"
+CODEX_HOME="$CODEX_TITLE_HOME" assert_eq "ordinary pane title is not a Codex session signal" "" \
+	"$(CODEX_HOME="$CODEX_TITLE_HOME" get_codex_session_from_pane_title "$$" "project shell")"
+
+printf '{"type":"session_meta","payload":{"id":"%s","timestamp":"2026-09-18T20:01:00Z","source":"cli"}}\n' \
+	"$CODEX_TITLE_AMBIGUOUS" >"$CODEX_TITLE_SESSIONS/rollout-root-$CODEX_TITLE_AMBIGUOUS.jsonl"
+CODEX_HOME="$CODEX_TITLE_HOME" assert_eq "ambiguous truncated Codex title is rejected" "" \
+	"$(CODEX_HOME="$CODEX_TITLE_HOME" get_codex_session_from_pane_title "$$" "${CODEX_TITLE_ID:0:29}...")"
+
+printf '{"type":"session_meta","payload":{"id":"%s","timestamp":"2026-09-18T20:02:00Z","source":{"subagent":{}}}}\n' \
+	"$CODEX_TITLE_SUBAGENT" >"$CODEX_TITLE_SESSIONS/rollout-subagent-$CODEX_TITLE_SUBAGENT.jsonl"
+CODEX_HOME="$CODEX_TITLE_HOME" assert_eq "subagent Codex title is not restored as a pane root" "" \
+	"$(CODEX_HOME="$CODEX_TITLE_HOME" get_codex_session_from_pane_title "$$" "$CODEX_TITLE_SUBAGENT")"
+
+USED_CODEX_SESSION_IDS=""
+register_codex_session_id "$CODEX_TITLE_ID"
+CODEX_HOME="$CODEX_TITLE_HOME" assert_eq "pane-title fallback rejects a session used by another pane" "" \
+	"$(CODEX_HOME="$CODEX_TITLE_HOME" get_codex_session "$$" "codex" "$CODEX_TITLE_ID")"
+USED_CODEX_SESSION_IDS=""
+
+CODEX_TITLE_PARTS="$SANDBOX/codex-title-parts"
+CODEX_TITLE_CACHE="$SANDBOX/codex-title-cache"
+: >"$CODEX_TITLE_PARTS"
+: >"$CODEX_TITLE_CACHE"
+CODEX_TITLE_CANDIDATES=$'codex\037'"$$"$'\037codex\n'
+CODEX_HOME="$CODEX_TITLE_HOME" resolve_pane_candidates \
+	"work:3.2" "/tmp" "/dev/ttys003" "$CODEX_TITLE_CANDIDATES" $'\037' 0 \
+	"$CODEX_TITLE_CACHE" "$CODEX_TITLE_PARTS" work 3 2 "$CODEX_TITLE_ID"
+assert_eq "pane-title fallback is persisted by the pane resolver" "$CODEX_TITLE_ID" \
+	"$(awk -F '\t' 'NR == 1 { print $3 }' "$CODEX_TITLE_PARTS")"
+USED_CODEX_SESSION_IDS=""
+
 echo "== unpredictable private save files =="
 RUN_DIR="$SANDBOX/run"
 STUB_DIR="$SANDBOX/bin"

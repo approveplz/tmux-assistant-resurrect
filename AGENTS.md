@@ -125,6 +125,11 @@ process args as a reliable fallback.
   process. Exclude rollouts whose `session_meta.source` identifies a subagent,
   then select the unique newest root by `session_meta.timestamp`. Missing or
   tied timestamps are ambiguous and must not fall through to stale launch args.
+- When open-file lookup is unavailable, a Codex pane title configured as
+  `thread-id` may identify the root rollout. Accept only a full UUID or a unique
+  29-character UUID prefix ending in `...`, after removing a transient activity
+  suffix. Require matching non-subagent rollout metadata, and reject files older
+  than the Codex process. Never guess from cwd.
 - Copilot exposes a PID-specific active-session signal: the live session writes
   `$COPILOT_HOME/session-state/<uuid>/inuse.<pid>.lock` (content = the same PID).
   Resolve it with a single glob — no `/proc`, no `lsof`, no platform branch, and
